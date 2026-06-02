@@ -63,7 +63,7 @@ Editing
 | `capture/screen.rs` | GDI BitBlt 截圖；active_window_rect()、window_rect(HWND) |
 | `capture/overlay.rs` | 兩種 overlay 視窗（框選/點選），各自有內部 message loop |
 | `editor/canvas.rs` | ScreenBitmap + 標註疊加，`flatten_to_bitmap()` 輸出最終影像 |
-| `editor/tool.rs` | `Stroke` enum（Pen/Arrow/Rect/Text），各工具 GDI 繪製邏輯 |
+| `editor/tool.rs` | `Stroke` enum（Pen/Arrow/Rect/Text/Crop），各工具 GDI 繪製邏輯；`Stroke::translate()` 供裁切後座標平移 |
 | `editor/window.rs` | 編輯器視窗：工具列、捲軸、滑鼠事件 → canvas |
 | `output/clipboard.rs` | Win32 clipboard CF_DIB 寫入（不用 arboard，HBITMAP 支援不完整） |
 | `output/file.rs` | BGRA → RGBA 轉換後用 image crate 存 PNG |
@@ -141,9 +141,30 @@ SetWindowPos(hwnd, None, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECH
 `SHCreateItemFromParsingName` 的 pbc 參數型別需明確：`None::<&IBindCtx>`。  
 `IFileDialog` 方法（`SetFileName`、`SetFolder`、`SetDefaultExtension`）可直接對 `IFileSaveDialog` 呼叫（COM 繼承）。
 
-### 裁切工具
+### 裁切工具與 Undo 系統
 
-`Canvas::crop(r: RECT)` 直接修改 `self.base`（裁切 ScreenBitmap 的 pixel 資料），並對所有 `strokes` 呼叫 `Stroke::translate(-x, -y)` 調整座標。裁切是破壞性操作（無法用復原還原 base bitmap）。
+`Canvas::crop(r: RECT)` 直接修改 `self.base`，並對所有 `strokes` 呼叫 `Stroke::translate(-x, -y)` 調整座標。  
+裁切前先把完整快照推入 `undo_ops: Vec<UndoOp>`（`UndoOp::Crop { base, width, height, strokes }`），可以復原。
+
+Undo 系統採 `UndoOp` enum：
+- `UndoOp::Stroke` → `strokes.pop()`
+- `UndoOp::Crop { snapshot }` → 還原整個 canvas 狀態
+
+新增筆畫須呼叫 `canvas.push_stroke(stroke, color, thickness)`（同步維護 undo_ops），**不可**直接 push 到 `canvas.strokes`。
+
+### 倒數計時（show_countdown）
+
+`overlay::show_countdown(seconds, highlight: Option<RECT>)` 在執行緒中同步阻塞 N 秒。
+
+```rust
+// 無 message loop 情況下同步繪製的方式：
+InvalidateRect(hwnd, None, false); // 必須先標記髒區域
+UpdateWindow(hwnd);                // 才會觸發同步 WM_PAINT
+```
+
+**不呼叫 `InvalidateRect`，`UpdateWindow` 不會重繪**（視窗已被標記為乾淨）。
+
+`highlight` 參數：倒數期間在全螢幕透明 overlay 上畫橘色框標示擷取區域，使用與 pick overlay 相同的 `UpdateLayeredWindow` 技術。`WS_EX_TRANSPARENT` 確保滑鼠事件穿透。
 
 ### 前景視窗
 
@@ -169,4 +190,5 @@ SetWindowPos(hwnd, HWND_NOTOPMOST, ..., SWP_NOMOVE|SWP_NOSIZE);
 - `WM_HSCROLL`/`WM_VSCROLL` 的 code（SB_LINEUP 等）型別是 `SCROLLBAR_COMMAND`，match 時須用 `.0` 或整數字面值
 - `HWND` 不實作 `Send`，跨執行緒傳遞視窗 handle 須先轉成 `isize`
 - `PtInRect` 在 `*` glob 不可用，改用直接座標比較
+- `DefWindowProcW` 是泛型函式，不能直接作為 `WNDCLASSEXW.lpfnWndProc` 的函式指標；需包一層 `unsafe extern "system" fn wrapper(h, m, w, l) -> LRESULT { DefWindowProcW(h, m, w, l) }`
 - 重新執行前先確認舊程序已結束：`Stop-Process -Name srcshot -Force`（否則 binary 被鎖定，`cargo build` 會失敗）

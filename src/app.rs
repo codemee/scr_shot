@@ -77,10 +77,7 @@ fn state_machine(
                     // 先取得目前作用中視窗的 rect（選定標的）
                     match screen::active_window_rect() {
                         Ok(rect) => {
-                            // 延遲後截圖，讓使用者準備好（如展開 tooltip）
-                            if delay > 0 {
-                                std::thread::sleep(std::time::Duration::from_secs(delay as u64));
-                            }
+                            if delay > 0 { overlay::show_countdown(delay, Some(rect)); }
                             match screen::capture_rect(rect, cursor) {
                                 Ok(bmp) => crate::editor::open(bmp, tx2, dir),
                                 Err(e) => {
@@ -108,10 +105,10 @@ fn state_machine(
                 };
                 std::thread::spawn(move || {
                     if delay > 0 {
-                        std::thread::sleep(std::time::Duration::from_secs(delay as u64));
+                        overlay::show_countdown(delay, Some(rect));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(80));
                     }
-                    // 額外 80ms 讓 GDI 刷新（overlay 已隱藏）
-                    std::thread::sleep(std::time::Duration::from_millis(80));
                     match screen::capture_rect(rect, cursor) {
                         Ok(bmp) => crate::editor::open(bmp, tx2, dir),
                         Err(e) => {
@@ -132,11 +129,13 @@ fn state_machine(
                     (c.capture_delay_secs, c.capture_cursor)
                 };
                 std::thread::spawn(move || {
-                    if delay > 0 {
-                        std::thread::sleep(std::time::Duration::from_secs(delay as u64));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(80));
                     let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
+                    if delay > 0 {
+                        let hl = screen::window_rect(hwnd).ok();
+                        overlay::show_countdown(delay, hl);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(80));
+                    }
                     match screen::window_rect(hwnd).and_then(|r| screen::capture_rect(r, cursor)) {
                         Ok(bmp) => crate::editor::open(bmp, tx2, dir),
                         Err(e) => {

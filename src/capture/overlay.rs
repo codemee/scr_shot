@@ -2,11 +2,12 @@ use std::sync::mpsc::Sender;
 use windows::core::w;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
-    DeleteObject, DIB_RGB_COLORS, FillRect,
-    GetDC, GetStockObject, InvalidateRect, NULL_BRUSH, ReleaseDC,
-    SelectObject, UpdateWindow, HBRUSH,
+    BACKGROUND_MODE, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
+    CreateSolidBrush, DeleteDC, DeleteObject, DIB_RGB_COLORS, DRAW_TEXT_FORMAT,
+    DrawTextW, Ellipse, EndPaint, FillRect,
+    GetDC, GetStockObject, InvalidateRect, NULL_BRUSH, PAINTSTRUCT, PS_SOLID,
+    ReleaseDC, SelectObject, SetBkMode, SetTextColor, UpdateWindow, HBRUSH,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, VK_ESCAPE,
@@ -506,6 +507,208 @@ fn normalise(x1: i32, y1: i32, x2: i32, y2: i32) -> RECT {
         right: x1.max(x2),
         bottom: y1.max(y2),
     }
+}
+
+// ─── Countdown ───────────────────────────────────────────────────────────────
+
+/// 顯示全螢幕置中的倒數計時視窗，每秒更新一次，計時結束後返回。
+/// `highlight`：在倒數期間以橘色框標示擷取區域（螢幕座標）。
+pub fn show_countdown(seconds: u32, highlight: Option<RECT>) {
+    if seconds == 0 { return; }
+    unsafe {
+        let class     = w!("srcshot_countdown");
+        let hinstance = get_instance();
+
+        // ── 擷取區域橘色框 overlay ──────────────────────────────────────
+        let hl_class = w!("srcshot_hl");
+        let hl_hwnd = if let Some(rect) = highlight {
+            let wc2 = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(hl_wnd_proc),
+                hInstance: hinstance,
+                lpszClassName: hl_class,
+                ..Default::default()
+            };
+            let _ = RegisterClassExW(&wc2);
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let h = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+                hl_class, w!(""), WS_POPUP,
+                vx, vy, vw, vh,
+                HWND(std::ptr::null_mut()), HMENU(std::ptr::null_mut()), hinstance, None,
+            ).unwrap_or(HWND(std::ptr::null_mut()));
+            if !h.0.is_null() {
+                draw_capture_border(h, rect);
+                ShowWindow(h, SW_SHOW);
+            }
+            h
+        } else { HWND(std::ptr::null_mut()) };
+
+        unsafe extern "system" fn cdown_proc(
+            hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
+        ) -> LRESULT {
+            match msg {
+                WM_NCCREATE => {
+                    let cs = &*(lp.0 as *const CREATESTRUCTW);
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as _);
+                    LRESULT(1)
+                }
+                WM_ERASEBKGND => LRESULT(1),
+                WM_PAINT => {
+                    let n = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32;
+                    let mut ps = PAINTSTRUCT::default();
+                    let hdc = BeginPaint(hwnd, &mut ps);
+                    let mut rc = RECT::default();
+                    GetClientRect(hwnd, &mut rc);
+
+                    // 深色圓形背景
+                    let bg  = CreateSolidBrush(COLORREF(0x00_28_28_28));
+                    let pen = CreatePen(PS_SOLID, 0, COLORREF(0x00_28_28_28));
+                    let op = SelectObject(hdc, pen);
+                    let ob = SelectObject(hdc, bg);
+                    Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
+                    SelectObject(hdc, op); SelectObject(hdc, ob);
+                    DeleteObject(bg); DeleteObject(pen);
+
+                    // 大白數字
+                    SetBkMode(hdc, BACKGROUND_MODE(1)); // TRANSPARENT
+                    SetTextColor(hdc, COLORREF(0x00_FF_FF_FF));
+                    let font = CreateFontW(
+                        (rc.bottom - rc.top) * 3 / 4, 0, 0, 0,
+                        700, 0, 0, 0, 0, 0, 0, 0, 0, w!("Segoe UI"),
+                    );
+                    let of = SelectObject(hdc, font);
+                    let mut tw: Vec<u16> = format!("{}", n).encode_utf16().collect();
+                    DrawTextW(hdc, &mut tw, &mut rc, DRAW_TEXT_FORMAT(0x25)); // center+vcenter+single
+                    SelectObject(hdc, of);
+                    DeleteObject(font);
+                    EndPaint(hwnd, &ps);
+                    LRESULT(0)
+                }
+                _ => DefWindowProcW(hwnd, msg, wp, lp),
+            }
+        }
+
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(cdown_proc),
+            hInstance: hinstance,
+            hbrBackground: HBRUSH(GetStockObject(NULL_BRUSH).0),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&wc);
+
+        let sw = GetSystemMetrics(SM_CXSCREEN);
+        let sh = GetSystemMetrics(SM_CYSCREEN);
+        let sz = 140i32;
+
+        let hwnd = match CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+            class, w!(""),
+            WS_POPUP,
+            (sw - sz) / 2, (sh - sz) / 2, sz, sz,
+            HWND(std::ptr::null_mut()),
+            HMENU(std::ptr::null_mut()),
+            hinstance,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(_) => { let _ = UnregisterClassW(class, hinstance); return; }
+        };
+
+        // 80% 不透明
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 204, LWA_ALPHA);
+
+        for i in (1..=seconds).rev() {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, i as isize);
+            ShowWindow(hwnd, SW_SHOW);
+            // InvalidateRect 標記髒區域，UpdateWindow 才會觸發 WM_PAINT
+            InvalidateRect(hwnd, None, false);
+            UpdateWindow(hwnd);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        // 先關閉 highlight overlay，再關閉倒數視窗，最後等畫面還原
+        if !hl_hwnd.0.is_null() {
+            DestroyWindow(hl_hwnd).ok();
+            let _ = UnregisterClassW(hl_class, hinstance);
+        }
+        DestroyWindow(hwnd).ok();
+        let _ = UnregisterClassW(class, hinstance);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+}
+
+unsafe extern "system" fn hl_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+/// 在透明全螢幕 overlay 上以橘色框標示擷取區域
+unsafe fn draw_capture_border(hwnd: HWND, capture_rect: RECT) {
+    let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if vw <= 0 || vh <= 0 { return; }
+
+    let screen_dc = GetDC(HWND(std::ptr::null_mut()));
+    let mem_dc    = CreateCompatibleDC(screen_dc);
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: vw, biHeight: -vh,
+            biPlanes: 1, biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        bmiColors: [Default::default()],
+    };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let dib = match CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        Ok(h) => h,
+        Err(_) => { DeleteDC(mem_dc); ReleaseDC(HWND(std::ptr::null_mut()), screen_dc); return; }
+    };
+    let old_bmp = SelectObject(mem_dc, dib);
+
+    let n = (vw * vh) as usize;
+    let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, n);
+    pixels.fill(0x00_00_00_00); // 全透明
+
+    // 橘色框（4px，完全不透明）
+    let l = (capture_rect.left   - vx).clamp(0, vw) as usize;
+    let t = (capture_rect.top    - vy).clamp(0, vh) as usize;
+    let r = (capture_rect.right  - vx).clamp(0, vw) as usize;
+    let b = (capture_rect.bottom - vy).clamp(0, vh) as usize;
+
+    if r > l && b > t {
+        const BW: usize = 4;
+        let vw_u = vw as usize;
+        let il = (l + BW).min(r);
+        let it = (t + BW).min(b);
+        let ir = if r > BW { r - BW } else { l };
+        let ib = if b > BW { b - BW } else { t };
+        const BC: u32 = 0xFF_FF_A8_00;
+        for row in t..it.min(b) { pixels[row*vw_u+l..row*vw_u+r].fill(BC); }
+        for row in ib.max(t)..b  { pixels[row*vw_u+l..row*vw_u+r].fill(BC); }
+        for row in it..ib { pixels[row*vw_u+l  ..row*vw_u+il].fill(BC); }
+        for row in it..ib { pixels[row*vw_u+ir ..row*vw_u+r ].fill(BC); }
+    }
+
+    let blend  = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1 };
+    let pt_dst = POINT { x: vx, y: vy };
+    let sz     = SIZE  { cx: vw, cy: vh };
+    let pt_src = POINT { x: 0,  y: 0  };
+    UpdateLayeredWindow(hwnd, screen_dc, Some(&pt_dst), Some(&sz),
+        mem_dc, Some(&pt_src), COLORREF(0), Some(&blend), ULW_ALPHA);
+
+    SelectObject(mem_dc, old_bmp);
+    DeleteObject(dib);
+    DeleteDC(mem_dc);
+    ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
 }
 
 fn get_instance() -> windows::Win32::Foundation::HINSTANCE {

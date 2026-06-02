@@ -10,6 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, DI_NORMAL, HICON,
 };
 
+#[derive(Clone)]
 pub struct ScreenBitmap {
     pub width: i32,
     pub height: i32,

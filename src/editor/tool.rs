@@ -21,6 +21,7 @@ pub enum Stroke {
     Text { pos: POINT, text: String },
 }
 
+#[derive(Clone, Copy)]
 pub struct Color(pub u32); // COLORREF (0x00BBGGRR)
 
 impl Stroke {

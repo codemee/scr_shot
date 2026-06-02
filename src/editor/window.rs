@@ -335,7 +335,11 @@ unsafe extern "system" fn editor_wnd_proc(
                     SetFocus(hwnd);
                 }
                 BTN_UNDO  => {
-                    state.canvas.strokes.pop();
+                    state.canvas.undo();
+                    // 裁切復原後畫布可能變大，捲軸需重算
+                    state.scroll_x = state.scroll_x.min((state.canvas.width  - 1).max(0));
+                    state.scroll_y = state.scroll_y.min((state.canvas.height - 1).max(0));
+                    update_scrollbars(hwnd, state);
                     InvalidateRect(hwnd, None, false);
                     SetFocus(hwnd);
                 }
@@ -454,11 +458,11 @@ unsafe extern "system" fn editor_wnd_proc(
                     }
                     state.canvas.current = None;
                 } else if let Some(stroke) = state.canvas.current.take() {
-                    state.canvas.strokes.push((
+                    state.canvas.push_stroke(
                         stroke,
                         super::tool::Color(state.canvas.tool_color),
                         state.canvas.tool_thickness,
-                    ));
+                    );
                 }
                 update_scrollbars(hwnd, state);
                 InvalidateRect(hwnd, None, false);
@@ -651,8 +655,8 @@ unsafe extern "system" fn editor_wnd_proc(
             let under = WindowFromPoint(pt);
             let btn_hover: i32 = if under.is_invalid() { -1 } else {
                 match GetDlgCtrlID(under) as usize {
-                    BTN_PEN   => 0, BTN_ARROW => 1, BTN_RECT => 2, BTN_TEXT => 3,
-                    BTN_COPY  => 4, BTN_SAVE  => 5, BTN_UNDO => 6, _ => -1,
+                    BTN_PEN   => 0, BTN_ARROW => 1, BTN_RECT  => 2, BTN_TEXT => 3,
+                    BTN_CROP  => 4, BTN_COPY  => 5, BTN_SAVE  => 6, BTN_UNDO => 7, _ => -1,
                 }
             };
             if btn_hover != state.hover_btn {

@@ -6,6 +6,16 @@ use windows::Win32::Graphics::Gdi::{
 use crate::capture::screen::ScreenBitmap;
 use super::tool::{Color, Stroke};
 
+enum UndoOp {
+    Stroke,
+    Crop {
+        base:    ScreenBitmap,
+        width:   i32,
+        height:  i32,
+        strokes: Vec<(Stroke, Color, i32)>,
+    },
+}
+
 pub struct Canvas {
     pub width: i32,
     pub height: i32,
@@ -16,6 +26,7 @@ pub struct Canvas {
     pub current: Option<Stroke>,
     pub tool_color: u32,   // COLORREF
     pub tool_thickness: i32,
+    undo_ops: Vec<UndoOp>,
 }
 
 impl Canvas {
@@ -30,6 +41,7 @@ impl Canvas {
             current: None,
             tool_color: 0x00_00_00_FF, // red
             tool_thickness: 3,
+            undo_ops: Vec::new(),
         }
     }
 
@@ -55,6 +67,26 @@ impl Canvas {
         }
     }
 
+    /// 加入一筆筆畫，並記錄到 undo stack
+    pub fn push_stroke(&mut self, stroke: Stroke, color: Color, thickness: i32) {
+        self.strokes.push((stroke, color, thickness));
+        self.undo_ops.push(UndoOp::Stroke);
+    }
+
+    /// 復原：移除最後一筆畫，或還原最後一次裁切
+    pub fn undo(&mut self) {
+        match self.undo_ops.pop() {
+            Some(UndoOp::Stroke) => { self.strokes.pop(); }
+            Some(UndoOp::Crop { base, width, height, strokes }) => {
+                self.base    = base;
+                self.width   = width;
+                self.height  = height;
+                self.strokes = strokes;
+            }
+            None => {}
+        }
+    }
+
     /// 裁切畫布：縮小 base bitmap，並平移所有筆畫座標
     pub fn crop(&mut self, r: windows::Win32::Foundation::RECT) {
         let x = r.left.clamp(0, self.width);
@@ -62,6 +94,14 @@ impl Canvas {
         let w = (r.right.clamp(0, self.width) - x).max(0);
         let h = (r.bottom.clamp(0, self.height) - y).max(0);
         if w <= 0 || h <= 0 { return; }
+
+        // 裁切前先儲存快照供 undo 使用
+        self.undo_ops.push(UndoOp::Crop {
+            base:    self.base.clone(),
+            width:   self.width,
+            height:  self.height,
+            strokes: self.strokes.clone(),
+        });
 
         let mut new_data = vec![0u8; (w * h * 4) as usize];
         for row in 0..h {

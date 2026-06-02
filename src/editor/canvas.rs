@@ -55,6 +55,33 @@ impl Canvas {
         }
     }
 
+    /// 裁切畫布：縮小 base bitmap，並平移所有筆畫座標
+    pub fn crop(&mut self, r: windows::Win32::Foundation::RECT) {
+        let x = r.left.clamp(0, self.width);
+        let y = r.top.clamp(0, self.height);
+        let w = (r.right.clamp(0, self.width) - x).max(0);
+        let h = (r.bottom.clamp(0, self.height) - y).max(0);
+        if w <= 0 || h <= 0 { return; }
+
+        let mut new_data = vec![0u8; (w * h * 4) as usize];
+        for row in 0..h {
+            let src = ((y + row) * self.width + x) as usize * 4;
+            let dst = (row * w) as usize * 4;
+            new_data[dst..dst + (w as usize * 4)]
+                .copy_from_slice(&self.base.data[src..src + (w as usize * 4)]);
+        }
+        self.base.data   = new_data;
+        self.base.width  = w;
+        self.base.height = h;
+        self.width  = w;
+        self.height = h;
+
+        for (stroke, _, _) in &mut self.strokes {
+            stroke.translate(-x, -y);
+        }
+        self.current = None;
+    }
+
     pub fn flatten_to_bitmap(&self) -> ScreenBitmap {
         // Return base + strokes composited via GDI
         // For simplicity, we render into a memory DC and read back pixels

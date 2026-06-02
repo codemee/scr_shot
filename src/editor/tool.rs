@@ -10,6 +10,7 @@ pub enum Tool {
     Arrow,
     Rect,
     Text,
+    Crop,
 }
 
 #[derive(Clone, Debug)]
@@ -21,6 +22,24 @@ pub enum Stroke {
 }
 
 pub struct Color(pub u32); // COLORREF (0x00BBGGRR)
+
+impl Stroke {
+    /// 平移所有座標（裁切後調整用）
+    pub fn translate(&mut self, dx: i32, dy: i32) {
+        match self {
+            Stroke::Pen { points } => {
+                for p in points.iter_mut() { p.x += dx; p.y += dy; }
+            }
+            Stroke::Arrow { from, to } => {
+                from.x += dx; from.y += dy; to.x += dx; to.y += dy;
+            }
+            Stroke::Rect { r } => {
+                r.left += dx; r.top += dy; r.right += dx; r.bottom += dy;
+            }
+            Stroke::Text { pos, .. } => { pos.x += dx; pos.y += dy; }
+        }
+    }
+}
 
 impl Stroke {
     pub fn draw(&self, hdc: HDC, color: Color, thickness: i32) {

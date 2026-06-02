@@ -2,37 +2,78 @@ use std::path::{Path, PathBuf};
 
 pub struct Config {
     pub save_dir: PathBuf,
+    pub capture_cursor: bool,
+    pub capture_delay_secs: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { save_dir: load_save_dir() }
+        let (cursor, delay) = load_settings();
+        Self {
+            save_dir: load_save_dir(),
+            capture_cursor: cursor,
+            capture_delay_secs: delay,
+        }
     }
 }
 
-/// 讀取上次儲存的目錄（%APPDATA%\srcshot\last_dir.txt），找不到則回傳桌面
+// ── 儲存目錄（由編輯器執行緒寫入）──────────────────────────────────────
+
 pub fn load_save_dir() -> PathBuf {
-    config_file()
+    config_dir()
+        .map(|p| p.join("last_dir.txt"))
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|s| PathBuf::from(s.trim()))
         .filter(|p| p.is_dir())
         .unwrap_or_else(default_dir)
 }
 
-/// 將目錄路徑寫入設定檔
 pub fn persist_save_dir(dir: &Path) {
-    if let Some(p) = config_file() {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&p, dir.to_string_lossy().as_bytes());
+    if let Some(base) = config_dir() {
+        let _ = std::fs::create_dir_all(&base);
+        let _ = std::fs::write(base.join("last_dir.txt"), dir.to_string_lossy().as_bytes());
     }
 }
 
-fn config_file() -> Option<PathBuf> {
+// ── 擷取設定（由系統匣執行緒讀寫）──────────────────────────────────────
+
+fn load_settings() -> (bool, u32) {
+    let mut cursor = false;
+    let mut delay  = 0u32;
+    let path = match config_dir().map(|p| p.join("settings.ini")) {
+        Some(p) => p,
+        None => return (cursor, delay),
+    };
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        for line in content.lines() {
+            if let Some(v) = line.strip_prefix("capture_cursor=") {
+                cursor = v == "1";
+            } else if let Some(v) = line.strip_prefix("capture_delay_secs=") {
+                delay = v.parse().unwrap_or(0);
+            }
+        }
+    }
+    (cursor, delay)
+}
+
+pub fn persist_settings(config: &Config) {
+    if let Some(base) = config_dir() {
+        let _ = std::fs::create_dir_all(&base);
+        let content = format!(
+            "capture_cursor={}\ncapture_delay_secs={}\n",
+            if config.capture_cursor { 1 } else { 0 },
+            config.capture_delay_secs,
+        );
+        let _ = std::fs::write(base.join("settings.ini"), content.as_bytes());
+    }
+}
+
+// ── 共用輔助 ───────────────────────────────────────────────────────────
+
+fn config_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
-        .map(|p| p.join("srcshot").join("last_dir.txt"))
+        .map(|p| p.join("srcshot"))
 }
 
 fn default_dir() -> PathBuf {

@@ -67,15 +67,16 @@ Editing
 | `editor/window.rs` | 編輯器視窗：工具列、捲軸、滑鼠事件 → canvas |
 | `output/clipboard.rs` | Win32 clipboard CF_DIB 寫入（不用 arboard，HBITMAP 支援不完整） |
 | `output/file.rs` | BGRA → RGBA 轉換後用 image crate 存 PNG |
-| `config.rs` | 儲存路徑（預設桌面），未來可擴充快捷鍵設定 |
+| `config.rs` | 儲存路徑、游標擷取開關、延遲秒數；設定寫入 `%APPDATA%\srcshot\` |
 
-### 截圖流程
+### 截圖流程（含延遲）
 
 1. 快捷鍵觸發 → `AppEvent` 送入 channel
-2. state_machine spawn 執行緒
-3. overlay 視窗（若需框選/點選）在子執行緒跑 message loop，完成後送 `RegionSelected` / `WindowPicked`
-4. 區域截圖：overlay 先 `ShowWindow(SW_HIDE)` + 等 80ms 讓 GDI 刷新，再 BitBlt
+2. state_machine 從 `Arc<Mutex<Config>>` 讀取 delay/cursor 設定
+3. overlay 視窗（若需框選/點選）**立刻出現**（不在前面加 delay）
+4. 使用者選好標的後：delay N 秒 → overlay `ShowWindow(SW_HIDE)` + 80ms GDI 刷新 → BitBlt
 5. `editor::open()` 在子執行緒跑 message loop；關閉時必送 `EditorSave` 或 `EditorCancelled`
+6. 編輯器開啟後用 `HWND_TOPMOST → SetForegroundWindow → HWND_NOTOPMOST` 確保前景
 
 ### 防閃爍
 
@@ -98,12 +99,27 @@ Editing
 
 `find_window_at(overlay, pt)` 用 `EnumWindows` 枚舉頂層視窗取代 `WindowFromPoint`，原因：`WindowFromPoint` 會傳回子視窗（按鈕、捲軸），導致高亮錯誤視窗。
 
-### 自訂按鈕（BS_OWNERDRAW + WM_DRAWITEM）
+### 編輯器工具列
 
-編輯器按鈕用 `WINDOW_STYLE(0x0000000Bu32)`（`BS_OWNERDRAW`）建立，在 `WM_DRAWITEM` 中：
+按鈕用 `WINDOW_STYLE(0x0000000Bu32)`（`BS_OWNERDRAW`）建立，`WM_DRAWITEM` 中：
 - `DRAWITEMSTRUCT` 在 `windows::Win32::UI::Controls`，**不在** `WindowsAndMessaging`
-- 按下狀態：`dis.itemState.0 & 0x0001`（`itemState` 是 `ODS_FLAGS` newtype，須用 `.0`）
-- 繪製：`RoundRect` 背景 + `DrawTextW` 置中文字 + `DEFAULT_GUI_FONT`
+- 按下狀態：`dis.itemState.0 & 0x0001`（`ODS_FLAGS` newtype，須用 `.0`）
+- 繪製：`RoundRect` 背景 + **GDI 圖示**（MoveToEx/LineTo/Polygon/Arc/Rectangle）
+- 工具游標（`WM_SETCURSOR`）：畫布區 (y ≥ TOOLBAR_H) 才切換；`hovering_canvas` flag 在 `WM_MOUSEMOVE` 維護
+- 按鈕點擊後須 `SetFocus(hwnd)` 才能恢復 ESC 等快捷鍵
+
+### Tooltip（自製，非 Win32 API）
+
+Win32 tooltip API (`TTF_SUBCLASS`) 在 `BS_OWNERDRAW` 按鈕 + 父視窗不接收 `WM_MOUSEMOVE` 的情況下不可靠。  
+改用**每 100ms 輪詢**的做法：
+
+```rust
+// WM_TIMER id=3 (每 100ms)
+WindowFromPoint(cursor_screen) → GetDlgCtrlID → 識別是哪個按鈕
+```
+停留同一按鈕 500ms 後顯示自製 popup（獨立 WNDCLASS，淺黃底 + DEFAULT_GUI_FONT 文字）。
+
+**關鍵陷阱**：子視窗（按鈕）擋住父視窗的 `WM_MOUSEMOVE`，父視窗永遠收不到按鈕上方的滑鼠移動事件。
 
 ### 巢狀 Dialog 不能呼叫 PostQuitMessage
 
@@ -119,10 +135,38 @@ SetWindowLongW(hwnd, GWL_STYLE, style | WS_HSCROLL.0 as i32);
 SetWindowPos(hwnd, None, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
 ```
 
+### 儲存對話框（IFileSaveDialog）
+
+編輯器執行緒須先 `CoInitializeEx(None, COINIT_APARTMENTTHREADED)` 才能使用 COM。  
+`SHCreateItemFromParsingName` 的 pbc 參數型別需明確：`None::<&IBindCtx>`。  
+`IFileDialog` 方法（`SetFileName`、`SetFolder`、`SetDefaultExtension`）可直接對 `IFileSaveDialog` 呼叫（COM 繼承）。
+
+### 裁切工具
+
+`Canvas::crop(r: RECT)` 直接修改 `self.base`（裁切 ScreenBitmap 的 pixel 資料），並對所有 `strokes` 呼叫 `Stroke::translate(-x, -y)` 調整座標。裁切是破壞性操作（無法用復原還原 base bitmap）。
+
+### 前景視窗
+
+`SetForegroundWindow` 在跨執行緒且距 WM_HOTKEY 超過 Windows 時間窗口時靜默失敗。  
+可靠做法：
+```rust
+SetWindowPos(hwnd, HWND_TOPMOST, ..., SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
+SetForegroundWindow(hwnd);
+SetWindowPos(hwnd, HWND_NOTOPMOST, ..., SWP_NOMOVE|SWP_NOSIZE);
+```
+
+### Pick Overlay：alpha=1 取代 alpha=0
+
+透明孔用 `0x01_00_00_00`（alpha=1）而非 `0x00_00_00_00`（alpha=0）。原因：`UpdateLayeredWindow` per-pixel alpha 下 alpha=0 像素**點擊穿透**到底下視窗，即使有 `SetCapture` 也可能遺失；alpha=1 視覺上透明但保留 hit-testing。
+
 ### windows crate 注意事項
 
 - `SetScrollInfo`、`DRAWITEMSTRUCT` 在 `Win32_UI_Controls`，**不在** `Win32_UI_WindowsAndMessaging`
+- `SetFocus`、`GetCapture`、`SetCapture`、`VK_*` 在 `Win32_UI_Input_KeyboardAndMouse`，不在 glob
+- `ScreenToClient`、`ClientToScreen` 不在 `WindowsAndMessaging` glob；改用 `GetMessagePos()` + `GetWindowRect()` 計算
+- `CheckMenuRadioItem`、`CheckMenuItem` 的 flags 參數型別是 `u32`，非 `MENU_ITEM_FLAGS`（須用 `.0`）
+- `TOOLINFOW` 在 windows-rs 0.58 中名為 `TTTOOLINFOW`
 - `WM_HSCROLL`/`WM_VSCROLL` 的 code（SB_LINEUP 等）型別是 `SCROLLBAR_COMMAND`，match 時須用 `.0` 或整數字面值
 - `HWND` 不實作 `Send`，跨執行緒傳遞視窗 handle 須先轉成 `isize`
-- `PtInRect` 在 `*` glob 不可用，改用直接座標比較：`pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom`
+- `PtInRect` 在 `*` glob 不可用，改用直接座標比較
 - 重新執行前先確認舊程序已結束：`Stop-Process -Name srcshot -Force`（否則 binary 被鎖定，`cargo build` 會失敗）

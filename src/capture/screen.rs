@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-    GetDC, ReleaseDC, SelectObject, SRCCOPY,
+    GetDC, ReleaseDC, SelectObject, SRCCOPY, HDC, HBRUSH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowRect,
+    CURSORINFO, CURSOR_SHOWING, GetCursorInfo, GetIconInfo, ICONINFO,
+    DrawIconEx, DI_NORMAL, HICON,
 };
 
 pub struct ScreenBitmap {
@@ -14,7 +16,7 @@ pub struct ScreenBitmap {
     pub data: Vec<u8>, // BGRA, row-major
 }
 
-pub fn capture_rect(rect: RECT) -> Result<ScreenBitmap> {
+pub fn capture_rect(rect: RECT, capture_cursor: bool) -> Result<ScreenBitmap> {
     let w = rect.right - rect.left;
     let h = rect.bottom - rect.top;
     anyhow::ensure!(w > 0 && h > 0, "empty rect");
@@ -28,6 +30,10 @@ pub fn capture_rect(rect: RECT) -> Result<ScreenBitmap> {
         BitBlt(mem_dc, 0, 0, w, h, screen_dc, rect.left, rect.top, SRCCOPY)
             .context("BitBlt failed")?;
 
+        if capture_cursor {
+            draw_cursor(mem_dc, &rect);
+        }
+
         let mut info = windows::Win32::Graphics::Gdi::BITMAPINFO {
             bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
@@ -36,21 +42,14 @@ pub fn capture_rect(rect: RECT) -> Result<ScreenBitmap> {
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: windows::Win32::Graphics::Gdi::BI_RGB.0,
-                biSizeImage: 0,
-                biXPelsPerMeter: 0,
-                biYPelsPerMeter: 0,
-                biClrUsed: 0,
-                biClrImportant: 0,
+                ..Default::default()
             },
             bmiColors: [windows::Win32::Graphics::Gdi::RGBQUAD::default()],
         };
 
         let mut pixels = vec![0u8; (w * h * 4) as usize];
         windows::Win32::Graphics::Gdi::GetDIBits(
-            mem_dc,
-            bmp,
-            0,
-            h as u32,
+            mem_dc, bmp, 0, h as u32,
             Some(pixels.as_mut_ptr() as *mut _),
             &mut info,
             windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
@@ -63,6 +62,34 @@ pub fn capture_rect(rect: RECT) -> Result<ScreenBitmap> {
 
         Ok(ScreenBitmap { width: w, height: h, data: pixels })
     }
+}
+
+/// 將滑鼠游標繪製到已擷取的 DC 上（考慮游標熱點偏移）
+unsafe fn draw_cursor(dc: HDC, rect: &RECT) {
+    let mut ci = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetCursorInfo(&mut ci).is_err() { return; }
+    if (ci.flags.0 & CURSOR_SHOWING.0) == 0 { return; }
+
+    let hicon = HICON(ci.hCursor.0);
+    let mut ii = ICONINFO::default();
+    if GetIconInfo(hicon, &mut ii).is_err() { return; }
+
+    // 清理 GetIconInfo 配置的 bitmap（避免洩漏）
+    if !ii.hbmColor.is_invalid() { let _ = DeleteObject(ii.hbmColor); }
+    if !ii.hbmMask.is_invalid()  { let _ = DeleteObject(ii.hbmMask);  }
+
+    let draw_x = ci.ptScreenPos.x - rect.left - ii.xHotspot as i32;
+    let draw_y = ci.ptScreenPos.y - rect.top  - ii.yHotspot as i32;
+
+    let _ = DrawIconEx(
+        dc, draw_x, draw_y, hicon,
+        0, 0, 0,
+        HBRUSH(std::ptr::null_mut()),
+        DI_NORMAL,
+    );
 }
 
 pub fn active_window_rect() -> Result<RECT> {

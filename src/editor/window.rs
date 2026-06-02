@@ -5,7 +5,8 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
     EndPaint, FillRect, GetDC, GetStockObject, InvalidateRect,
-    ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor,
+    Arc as GdiArc, LineTo, MoveToEx, NULL_BRUSH, Polygon, Polyline,
+    Rectangle as GdiRectangle, ReleaseDC, RoundRect, SelectObject, SetBkMode,
     BACKGROUND_MODE, DEFAULT_GUI_FONT, DRAW_TEXT_FORMAT, PAINTSTRUCT,
     PS_SOLID, SRCCOPY,
 };
@@ -27,6 +28,7 @@ const BTN_PEN: usize   = 10;
 const BTN_ARROW: usize = 11;
 const BTN_RECT: usize  = 12;
 const BTN_TEXT: usize  = 13;
+const BTN_CROP: usize  = 14;
 const BTN_COPY: usize  = 20;
 const BTN_SAVE: usize  = 21;
 const BTN_UNDO: usize  = 22;
@@ -42,6 +44,9 @@ struct EditorState {
     scroll_x: i32,
     scroll_y: i32,
     hovering_canvas: bool, // 游標是否在畫布區（工具列以下）
+    tooltip: HWND,         // 自製 tooltip 視窗
+    hover_btn: i32,        // 目前 hover 的按鈕索引（0-6），-1 = 無
+    hover_ticks: i32,      // 連續 hover 相同按鈕的 poll 次數（用於延遲顯示）
 }
 
 pub fn open(bmp: ScreenBitmap, tx: Sender<AppEvent>, save_dir: std::path::PathBuf) {
@@ -73,8 +78,8 @@ pub fn open(bmp: ScreenBitmap, tx: Sender<AppEvent>, save_dir: std::path::PathBu
         // 視窗初始大小：不小於工具列按鈕所需寬度，不超過畫面的 90%
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        // 7 個按鈕的最小寬度：BTN_MARGIN + 7×(BTN_W+BTN_MARGIN)
-        let min_w = BTN_MARGIN + 7 * (BTN_W + BTN_MARGIN) + 20;
+        // 8 個按鈕的最小寬度：BTN_MARGIN + 8×(BTN_W+BTN_MARGIN)
+        let min_w = BTN_MARGIN + 8 * (BTN_W + BTN_MARGIN) + 20;
         let min_h = TOOLBAR_H + 120; // 工具列 + 最小畫布顯示高度
         let win_w = (canvas.width + 20).max(min_w).min(screen_w * 9 / 10);
         let win_h = (canvas.height + TOOLBAR_H + 45).max(min_h).min(screen_h * 9 / 10);
@@ -90,6 +95,9 @@ pub fn open(bmp: ScreenBitmap, tx: Sender<AppEvent>, save_dir: std::path::PathBu
             scroll_x: 0,
             scroll_y: 0,
             hovering_canvas: false,
+            tooltip: HWND(std::ptr::null_mut()),
+            hover_btn: -1,
+            hover_ticks: 0,
         });
 
         let hwnd = CreateWindowExW(
@@ -111,7 +119,36 @@ pub fn open(bmp: ScreenBitmap, tx: Sender<AppEvent>, save_dir: std::path::PathBu
         SendMessageW(hwnd, WM_SETICON, WPARAM(0), LPARAM(app_icon.0 as isize)); // ICON_SMALL
 
         create_toolbar(hwnd);
+
+        // 自製 tooltip 視窗（比 Win32 tooltip API 可靠）
+        let tip_class = w!("srcshot_tipwnd");
+        let tip_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(tip_wnd_proc),
+            hInstance: hinstance,
+            lpszClassName: tip_class,
+            ..Default::default()
+        };
+        let _ = RegisterClassExW(&tip_wc);
+        let tooltip = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            tip_class, w!(""),
+            WS_POPUP | WS_BORDER,
+            0, 0, 70, 22,
+            hwnd, HMENU(std::ptr::null_mut()), hinstance, None,
+        ).unwrap_or(HWND(std::ptr::null_mut()));
+        let sp = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState;
+        if !sp.is_null() { (*sp).tooltip = tooltip; }
+        // 每 100ms 輪詢一次游標位置，用於 tooltip 偵測（子視窗擋住父視窗的 WM_MOUSEMOVE）
+        SetTimer(hwnd, 3, 100, None);
+
+        // SetForegroundWindow 在跨執行緒且距 WM_HOTKEY 較久時可能因前景鎖失敗。
+        // 先暫設 TOPMOST 強制置頂，之後恢復 NOTOPMOST，讓視窗可靠地出現在前景。
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW).ok();
         SetForegroundWindow(hwnd).ok();
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE).ok();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
@@ -121,35 +158,23 @@ pub fn open(bmp: ScreenBitmap, tx: Sender<AppEvent>, save_dir: std::path::PathBu
 
         DestroyIcon(app_icon).ok();
         let _ = UnregisterClassW(class, hinstance);
+        let _ = UnregisterClassW(w!("srcshot_tipwnd"), hinstance);
         CoUninitialize();
     }
 }
 
 unsafe fn create_toolbar(parent: HWND) {
     let hinstance = get_instance();
-    let buttons: &[(&windows::core::PCWSTR, usize)] = &[
-        (&w!("筆"),   BTN_PEN),
-        (&w!("箭頭"), BTN_ARROW),
-        (&w!("矩形"), BTN_RECT),
-        (&w!("文字"), BTN_TEXT),
-        (&w!("複製"), BTN_COPY),
-        (&w!("儲存"), BTN_SAVE),
-        (&w!("復原"), BTN_UNDO),
-    ];
-    for (i, (label, id)) in buttons.iter().enumerate() {
+    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_COPY, BTN_SAVE, BTN_UNDO]
+        .iter().enumerate()
+    {
         let x = BTN_MARGIN + i as i32 * (BTN_W + BTN_MARGIN);
         CreateWindowExW(
-            Default::default(),
-            w!("BUTTON"),
-            **label,
+            Default::default(), w!("BUTTON"), w!(""),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x0000000Bu32), // BS_OWNERDRAW
             x, 6, BTN_W, BTN_H,
-            parent,
-            HMENU(*id as *mut _),
-            hinstance,
-            None,
-        )
-        .unwrap();
+            parent, HMENU(*id as *mut _), hinstance, None,
+        ).unwrap();
     }
 }
 
@@ -294,20 +319,19 @@ unsafe extern "system" fn editor_wnd_proc(
             let id = (wp.0 & 0xFFFF) as usize;
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
             match id {
-                BTN_PEN | BTN_ARROW | BTN_RECT | BTN_TEXT => {
+                BTN_PEN | BTN_ARROW | BTN_RECT | BTN_TEXT | BTN_CROP => {
                     state.active_tool = match id {
                         BTN_PEN   => Tool::Pen,
                         BTN_ARROW => Tool::Arrow,
                         BTN_RECT  => Tool::Rect,
-                        _         => Tool::Text,
+                        BTN_TEXT  => Tool::Text,
+                        _         => Tool::Crop,
                     };
-                    // 強制所有工具按鈕重繪，使 active 高亮即時更新
-                    for bid in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT] {
+                    for bid in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP] {
                         if let Ok(btn) = GetDlgItem(hwnd, bid as i32) {
                             InvalidateRect(btn, None, false);
                         }
                     }
-                    // 將焦點還給編輯器視窗，確保 ESC 等鍵盤事件正常觸發
                     SetFocus(hwnd);
                 }
                 BTN_UNDO  => {
@@ -349,6 +373,9 @@ unsafe extern "system" fn editor_wnd_proc(
         }
         WM_LBUTTONDOWN => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+            // 點擊時隱藏 tooltip
+            if !state.tooltip.0.is_null() { ShowWindow(state.tooltip, SW_HIDE); }
+            state.hover_ticks = 0;
             let (cx, cy) = client_xy(lp);
             let cy_canvas = cy - TOOLBAR_H;
             if cy_canvas < 0 { return LRESULT(0); }
@@ -380,8 +407,8 @@ unsafe extern "system" fn editor_wnd_proc(
         }
         WM_MOUSEMOVE => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
-            let (_, cy_check) = client_xy(lp);
-            state.hovering_canvas = cy_check >= TOOLBAR_H;
+            let (_, cy_mm) = client_xy(lp);
+            state.hovering_canvas = cy_mm >= TOOLBAR_H;
             if !state.dragging { return LRESULT(0); }
             let (cx, cy) = client_xy(lp);
             let pt = POINT {
@@ -397,7 +424,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 Tool::Arrow => {
                     state.canvas.current = Some(Stroke::Arrow { from: state.drag_start, to: pt });
                 }
-                Tool::Rect => {
+                Tool::Rect | Tool::Crop => {
                     let s = state.drag_start;
                     state.canvas.current = Some(Stroke::Rect {
                         r: RECT {
@@ -416,13 +443,24 @@ unsafe extern "system" fn editor_wnd_proc(
             if state.dragging {
                 state.dragging = false;
                 ReleaseCapture().unwrap();
-                if let Some(stroke) = state.canvas.current.take() {
+                if state.active_tool == Tool::Crop {
+                    // 取得裁切矩形後直接套用
+                    if let Some(Stroke::Rect { r }) = state.canvas.current.take() {
+                        if r.right - r.left > 4 && r.bottom - r.top > 4 {
+                            state.canvas.crop(r);
+                            state.scroll_x = 0;
+                            state.scroll_y = 0;
+                        }
+                    }
+                    state.canvas.current = None;
+                } else if let Some(stroke) = state.canvas.current.take() {
                     state.canvas.strokes.push((
                         stroke,
                         super::tool::Color(state.canvas.tool_color),
                         state.canvas.tool_thickness,
                     ));
                 }
+                update_scrollbars(hwnd, state);
                 InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
@@ -487,7 +525,8 @@ unsafe extern "system" fn editor_wnd_proc(
                 (id == BTN_PEN   && state.active_tool == Tool::Pen)   ||
                 (id == BTN_ARROW && state.active_tool == Tool::Arrow)  ||
                 (id == BTN_RECT  && state.active_tool == Tool::Rect)   ||
-                (id == BTN_TEXT  && state.active_tool == Tool::Text);
+                (id == BTN_TEXT  && state.active_tool == Tool::Text)   ||
+                (id == BTN_CROP  && state.active_tool == Tool::Crop);
 
             // COLORREF = 0x00BBGGRR
             let bg = if is_pressed {
@@ -508,7 +547,7 @@ unsafe extern "system" fn editor_wnd_proc(
             };
 
             let hdc = dis.hDC;
-            let mut rc = dis.rcItem;
+            let rc = dis.rcItem;
 
             // 繪製圓角矩形背景
             let pen   = CreatePen(PS_SOLID, 0, bg);
@@ -521,22 +560,119 @@ unsafe extern "system" fn editor_wnd_proc(
             DeleteObject(pen);
             DeleteObject(brush);
 
-            // 文字（置中）
-            SetBkMode(hdc, BACKGROUND_MODE(1)); // TRANSPARENT
-            SetTextColor(hdc, text_color);
-            let font = GetStockObject(DEFAULT_GUI_FONT);
-            let old_f = SelectObject(hdc, font);
-            let mut buf = [0u16; 32];
-            let len = GetWindowTextW(dis.hwndItem, &mut buf);
-            DrawTextW(
-                hdc,
-                &mut buf[..len as usize],
-                &mut rc,
-                DRAW_TEXT_FORMAT(0x0025), // DT_CENTER|DT_VCENTER|DT_SINGLELINE
-            );
-            SelectObject(hdc, old_f);
+            // 圖示（以 GDI 繪製，置中於按鈕）
+            let cx = (rc.left + rc.right) / 2;
+            let cy = (rc.top + rc.bottom) / 2;
+            let ip = CreatePen(PS_SOLID, 2, text_color);
+            let ib = CreateSolidBrush(text_color);
+            let op = SelectObject(hdc, ip);
+            let ob = SelectObject(hdc, ib);
+            let nb = GetStockObject(NULL_BRUSH);
+
+            match id {
+                BTN_PEN => {
+                    // 斜線筆身 + 三角筆尖
+                    let _ = Polyline(hdc, &[POINT{x:cx-8,y:cy-8}, POINT{x:cx+4,y:cy+4}]);
+                    let _ = Polygon(hdc, &[
+                        POINT{x:cx+4,y:cy+4}, POINT{x:cx+9,y:cy+1}, POINT{x:cx+1,y:cy+9},
+                    ]);
+                }
+                BTN_ARROW => {
+                    // 水平線 + 右箭頭
+                    let _ = Polyline(hdc, &[POINT{x:cx-10,y:cy}, POINT{x:cx+3,y:cy}]);
+                    let _ = Polygon(hdc, &[
+                        POINT{x:cx+3,y:cy-6}, POINT{x:cx+11,y:cy}, POINT{x:cx+3,y:cy+6},
+                    ]);
+                }
+                BTN_RECT => {
+                    // 空心矩形
+                    let o = SelectObject(hdc, nb);
+                    let _ = GdiRectangle(hdc, cx-10, cy-7, cx+10, cy+7);
+                    SelectObject(hdc, o);
+                }
+                BTN_TEXT => {
+                    let _ = MoveToEx(hdc, cx-9, cy-8, None); let _ = LineTo(hdc, cx+9, cy-8);
+                    let _ = MoveToEx(hdc, cx,   cy-8, None); let _ = LineTo(hdc, cx,   cy+8);
+                }
+                BTN_CROP => {
+                    // 經典裁切圖示：矩形 + 四角延伸線
+                    let o = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                    let _ = GdiRectangle(hdc, cx-7, cy-7, cx+7, cy+7);
+                    SelectObject(hdc, o);
+                    let _ = MoveToEx(hdc, cx-7, cy-11, None); let _ = LineTo(hdc, cx-7, cy-7);
+                    let _ = MoveToEx(hdc, cx-11,cy-7,  None); let _ = LineTo(hdc, cx-7, cy-7);
+                    let _ = MoveToEx(hdc, cx+7, cy-11, None); let _ = LineTo(hdc, cx+7, cy-7);
+                    let _ = MoveToEx(hdc, cx+11,cy-7,  None); let _ = LineTo(hdc, cx+7, cy-7);
+                    let _ = MoveToEx(hdc, cx-7, cy+11, None); let _ = LineTo(hdc, cx-7, cy+7);
+                    let _ = MoveToEx(hdc, cx-11,cy+7,  None); let _ = LineTo(hdc, cx-7, cy+7);
+                    let _ = MoveToEx(hdc, cx+7, cy+11, None); let _ = LineTo(hdc, cx+7, cy+7);
+                    let _ = MoveToEx(hdc, cx+11,cy+7,  None); let _ = LineTo(hdc, cx+7, cy+7);
+                }
+                BTN_COPY => {
+                    // 兩個偏移的空心矩形
+                    let o = SelectObject(hdc, nb);
+                    let _ = GdiRectangle(hdc, cx-9, cy-3, cx+4, cy+9);
+                    let _ = GdiRectangle(hdc, cx-4, cy-9, cx+9, cy+3);
+                    SelectObject(hdc, o);
+                }
+                BTN_SAVE => {
+                    // 向下箭頭 + 底線
+                    let _ = MoveToEx(hdc, cx, cy-9, None); let _ = LineTo(hdc, cx, cy);
+                    let _ = Polygon(hdc, &[
+                        POINT{x:cx-7,y:cy}, POINT{x:cx,y:cy+8}, POINT{x:cx+7,y:cy},
+                    ]);
+                    let _ = MoveToEx(hdc, cx-10, cy+10, None); let _ = LineTo(hdc, cx+10, cy+10);
+                }
+                BTN_UNDO => {
+                    // 上半圓弧（從右到左，逆時針）= 標準 undo 外形
+                    let _ = GdiArc(hdc, cx-9, cy-8, cx+9, cy+8,
+                        cx+9, cy,   // 起點：右中
+                        cx-9, cy);  // 終點：左中
+                    // 箭頭尖端朝下（弧線在左中結束，方向向下）
+                    let _ = Polygon(hdc, &[
+                        POINT{x:cx-9,  y:cy+6}, // 尖端
+                        POINT{x:cx-14, y:cy},   // 左底
+                        POINT{x:cx-4,  y:cy},   // 右底
+                    ]);
+                }
+                _ => {}
+            }
+
+            SelectObject(hdc, op); SelectObject(hdc, ob);
+            DeleteObject(ip); DeleteObject(ib);
 
             LRESULT(1)
+        }
+        WM_TIMER if wp.0 == 3 => {
+            // 每 100ms 輪詢：用 WindowFromPoint 偵測游標在哪個按鈕上
+            let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+            let mut pt = POINT::default();
+            GetCursorPos(&mut pt).ok();
+            let under = WindowFromPoint(pt);
+            let btn_hover: i32 = if under.is_invalid() { -1 } else {
+                match GetDlgCtrlID(under) as usize {
+                    BTN_PEN   => 0, BTN_ARROW => 1, BTN_RECT => 2, BTN_TEXT => 3,
+                    BTN_COPY  => 4, BTN_SAVE  => 5, BTN_UNDO => 6, _ => -1,
+                }
+            };
+            if btn_hover != state.hover_btn {
+                state.hover_btn = btn_hover;
+                state.hover_ticks = 0;
+                if !state.tooltip.0.is_null() { ShowWindow(state.tooltip, SW_HIDE); }
+            } else if btn_hover >= 0 {
+                state.hover_ticks += 1;
+                if state.hover_ticks == 5 { // 5×100ms = 500ms 後顯示
+                    let labels = ["筆","箭頭","矩形","文字","裁切","複製","儲存","復原"];
+                    if let Some(label) = labels.get(btn_hover as usize) {
+                        let text: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+                        SetWindowTextW(state.tooltip, windows::core::PCWSTR(text.as_ptr())).ok();
+                        InvalidateRect(state.tooltip, None, false);
+                        SetWindowPos(state.tooltip, HWND_TOPMOST,
+                            pt.x + 4, pt.y + 20, 72, 22, SWP_SHOWWINDOW | SWP_NOZORDER).ok();
+                    }
+                }
+            }
+            LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_SETCURSOR => {
@@ -565,6 +701,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 if !state.result_sent {
                     let _ = state.tx.send(AppEvent::EditorCancelled);
                 }
+                if !state.tooltip.0.is_null() { DestroyWindow(state.tooltip).ok(); }
                 drop(Box::from_raw(ptr));
             }
             PostQuitMessage(0);
@@ -729,6 +866,37 @@ unsafe fn show_save_dialog(owner: HWND, initial_dir: &std::path::Path) -> Option
     let path_raw = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
     let path_str = path_raw.to_string().ok()?;
     Some(std::path::PathBuf::from(path_str))
+}
+
+/// 自製 tooltip 視窗的 wnd proc：畫淺黃底 + 文字
+unsafe extern "system" fn tip_wnd_proc(
+    hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
+) -> LRESULT {
+    use windows::Win32::Foundation::COLORREF;
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc = RECT::default();
+            GetClientRect(hwnd, &mut rc);
+            let bg = CreateSolidBrush(COLORREF(0x00_E1_FF_FF)); // 淺黃
+            FillRect(hdc, &rc, bg);
+            DeleteObject(bg);
+            let mut buf = [0u16; 32];
+            let n = GetWindowTextW(hwnd, &mut buf) as usize;
+            if n > 0 {
+                SetBkMode(hdc, BACKGROUND_MODE(1)); // TRANSPARENT
+                let font = GetStockObject(DEFAULT_GUI_FONT);
+                let of = SelectObject(hdc, font);
+                DrawTextW(hdc, &mut buf[..n], &mut rc, DRAW_TEXT_FORMAT(0x25));
+                SelectObject(hdc, of);
+            }
+            EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
 }
 
 fn get_instance() -> windows::Win32::Foundation::HINSTANCE {

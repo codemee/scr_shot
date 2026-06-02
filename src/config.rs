@@ -1,102 +1,43 @@
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HotkeyConfig {
-    pub fullscreen: String,
-    pub active_window: String,
-    pub region: String,
-    pub select_window: String,
-}
-
-impl Default for HotkeyConfig {
-    fn default() -> Self {
-        Self {
-            fullscreen: "PrintScreen".into(),
-            active_window: "Ctrl+Shift+A".into(),
-            region: "Ctrl+Shift+R".into(),
-            select_window: "Ctrl+Shift+W".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputConfig {
-    pub format: String,
-    pub directory: String,
-    pub filename_template: String,
-}
-
-impl Default for OutputConfig {
-    fn default() -> Self {
-        Self {
-            format: "png".into(),
-            directory: dirs().into(),
-            filename_template: "screenshot_{yyyy}-{mm}-{dd}_{hh}-{ii}-{ss}".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub hotkeys: HotkeyConfig,
-    pub output: OutputConfig,
-    pub copy_to_clipboard: bool,
-    pub show_cursor: bool,
+    pub save_dir: PathBuf,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            hotkeys: HotkeyConfig::default(),
-            output: OutputConfig::default(),
-            copy_to_clipboard: true,
-            show_cursor: false,
-        }
+        Self { save_dir: load_save_dir() }
     }
 }
 
-fn dirs() -> String {
-    if let Ok(p) = std::env::var("USERPROFILE") {
-        let mut path = PathBuf::from(p);
-        path.push("Pictures");
-        path.push("Screenshots");
-        path.to_string_lossy().into()
-    } else {
-        ".".into()
-    }
+/// 讀取上次儲存的目錄（%APPDATA%\srcshot\last_dir.txt），找不到則回傳桌面
+pub fn load_save_dir() -> PathBuf {
+    config_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(default_dir)
 }
 
-impl Config {
-    pub fn load() -> Self {
-        let path = config_path();
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            if let Ok(c) = serde_json::from_str(&s) {
-                return c;
-            }
-        }
-        let cfg = Config::default();
-        let _ = cfg.save();
-        cfg
-    }
-
-    pub fn save(&self) -> Result<(), String> {
-        let path = config_path();
-        if let Some(parent) = path.parent() {
+/// 將目錄路徑寫入設定檔
+pub fn persist_save_dir(dir: &Path) {
+    if let Some(p) = config_file() {
+        if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, s).map_err(|e| e.to_string())
+        let _ = std::fs::write(&p, dir.to_string_lossy().as_bytes());
     }
 }
 
-fn config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("APPDATA") {
-        let mut path = PathBuf::from(p);
-        path.push("srcshot");
-        path.push("config.json");
-        path
-    } else {
-        PathBuf::from("config.json")
-    }
+fn config_file() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|p| p.join("srcshot").join("last_dir.txt"))
+}
+
+fn default_dir() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|p| p.join("Desktop"))
+        .unwrap_or_else(|| PathBuf::from("."))
 }

@@ -1,186 +1,122 @@
-use std::sync::mpsc;
-use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+use windows::Win32::UI::WindowsAndMessaging::*;
 
-use eframe::egui;
-use image::RgbaImage;
-
-use crate::app_state::{CaptureMode, CapturedImage, MainCmd, Win32Event};
-use crate::clipboard;
+use crate::capture::{overlay, screen};
 use crate::config::Config;
-use crate::editor::panel::EditorPanel;
+use crate::event::AppEvent;
+use crate::hotkey;
+use crate::tray;
 
-pub struct ScreenshotApp {
-    tx: mpsc::Sender<MainCmd>,
-    rx: mpsc::Receiver<Win32Event>,
-    config: Config,
-    editor: Option<EditorPanel>,
-    visible: bool,
-    last_capture: Option<CapturedImage>,
+#[derive(PartialEq)]
+enum AppState {
+    Idle,
+    OverlayRegion,
+    OverlayPick,
+    Editing,
 }
 
-impl ScreenshotApp {
-    pub fn new(config: Config, tx: mpsc::Sender<MainCmd>, rx: mpsc::Receiver<Win32Event>) -> Self {
-        Self {
-            tx, rx, config,
-            editor: None,
-            visible: false,
-            last_capture: None,
+pub fn run(config: Config) -> anyhow::Result<()> {
+    let (tx, rx) = mpsc::channel::<AppEvent>();
+
+    let msg_hwnd = tray::create_message_window(tx.clone());
+    hotkey::register_all(msg_hwnd)?;
+    let _tray = tray::make_tray(msg_hwnd);
+
+    // Pump the Win32 message loop on this thread; events arrive via WM_HOTKEY
+    // and WM_COMMAND and are forwarded to our channel in tray::msg_wnd_proc.
+    // We run a secondary thread to consume the channel and drive the state machine.
+    let tx2 = tx.clone();
+    let save_dir = config.save_dir.clone();
+
+    std::thread::spawn(move || {
+        state_machine(rx, tx2, save_dir);
+    });
+
+    // Main thread: Win32 message loop
+    unsafe {
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, windows::Win32::Foundation::HWND(std::ptr::null_mut()), 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
     }
+
+    hotkey::unregister_all(msg_hwnd);
+    Ok(())
 }
 
-impl eframe::App for ScreenshotApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        while let Ok(event) = self.rx.try_recv() {
-            match event {
-                Win32Event::CaptureResult(cap) => {
-                    let mode = self.detect_mode();
-                    self.last_capture = Some(cap.clone());
-                    self.editor = Some(EditorPanel::new(&cap, mode));
-                    self.visible = true;
-                    frame.set_visible(true);
-                }
-                Win32Event::CaptureCancelled => {
-                    self.visible = false;
-                    frame.set_visible(false);
-                }
-                Win32Event::ShowWindow => {
-                    self.visible = true;
-                    frame.set_visible(true);
-                }
-                Win32Event::HideWindow => {
-                    self.visible = false;
-                    frame.set_visible(false);
-                }
+fn state_machine(rx: Receiver<AppEvent>, tx: Sender<AppEvent>, save_dir: std::path::PathBuf) {
+    let mut state = AppState::Idle;
+
+    for event in rx {
+        match (&state, event) {
+            (AppState::Idle, AppEvent::CaptureRegion) => {
+                state = AppState::OverlayRegion;
+                let tx2 = tx.clone();
+                std::thread::spawn(move || overlay::show_region(tx2));
             }
-        }
-
-        if !self.visible {
-            ctx.request_repaint();
-            return;
-        }
-
-        if let Some(editor) = &mut self.editor {
-            let save_happened = std::cell::Cell::new(false);
-            let cancel_happened = std::cell::Cell::new(false);
-
-            {
-                let tx = self.tx.clone();
-                let config_dir = self.config.output.directory.clone();
-                let config_fmt = self.config.output.format.clone();
-                let clip = self.config.copy_to_clipboard;
-
-                let mut save_cb = |img: &RgbaImage| {
-                    let name = generate_filename(&config_fmt);
-                    let mut path = PathBuf::from(&config_dir);
-                    path.push(&name);
-                    let fmt = if config_fmt == "png" { image::ImageFormat::Png }
-                             else { image::ImageFormat::Jpeg };
-
-                    if let Err(e) = img.save_with_format(&path, fmt) {
-                        eprintln!("save failed: {e}");
-                    } else {
-                        println!("saved: {}", path.display());
-                    }
-
-                    if clip {
-                        if let Err(e) = clipboard::copy_image(img) {
-                            eprintln!("clipboard failed: {e}");
+            (AppState::Idle, AppEvent::CaptureActiveWindow) => {
+                state = AppState::Editing;
+                let tx2 = tx.clone();
+                let dir = save_dir.clone();
+                std::thread::spawn(move || {
+                    match screen::active_window_rect().and_then(|r| screen::capture_rect(r)) {
+                        Ok(bmp) => crate::editor::open(bmp, tx2, dir),
+                        Err(e) => {
+                            eprintln!("capture error: {e}");
+                            let _ = tx2.send(AppEvent::EditorCancelled);
                         }
                     }
-
-                    save_happened.set(true);
-                };
-
-                let mut cancel_cb = || {
-                    cancel_happened.set(true);
-                };
-
-                editor.show(ctx, &mut save_cb, &mut cancel_cb);
-
-                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    cancel_happened.set(true);
-                }
+                });
             }
-
-            if save_happened.get() || cancel_happened.get() {
-                self.editor = None;
-                self.visible = false;
-                frame.set_visible(false);
+            (AppState::Idle, AppEvent::CapturePickWindow) => {
+                state = AppState::OverlayPick;
+                let tx2 = tx.clone();
+                std::thread::spawn(move || overlay::show_pick(tx2));
             }
-        } else {
-            egui::CentralPanel::default().show(ctx, |_ui| {});
+            (AppState::OverlayRegion, AppEvent::RegionSelected(rect)) => {
+                state = AppState::Editing;
+                let tx2 = tx.clone();
+                let dir = save_dir.clone();
+                std::thread::spawn(move || {
+                    // 等螢幕刷新（overlay 已隱藏，但 GDI 還需一點時間合成）
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    match screen::capture_rect(rect) {
+                        Ok(bmp) => crate::editor::open(bmp, tx2, dir),
+                        Err(e) => {
+                            eprintln!("capture error: {e}");
+                            let _ = tx2.send(AppEvent::EditorCancelled);
+                        }
+                    }
+                });
+            }
+            (AppState::OverlayPick, AppEvent::WindowPicked(hwnd_raw)) => {
+                state = AppState::Editing;
+                let tx2 = tx.clone();
+                let dir = save_dir.clone();
+                std::thread::spawn(move || {
+                    // 等 GDI 完成合成（overlay 已隱藏，但需時間刷新）
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
+                    match screen::window_rect(hwnd).and_then(|r| screen::capture_rect(r)) {
+                        Ok(bmp) => crate::editor::open(bmp, tx2, dir),
+                        Err(e) => {
+                            eprintln!("capture error: {e}");
+                            let _ = tx2.send(AppEvent::EditorCancelled);
+                        }
+                    }
+                });
+            }
+            (AppState::OverlayRegion | AppState::OverlayPick, AppEvent::OverlayCancelled) => {
+                state = AppState::Idle;
+            }
+            (AppState::Editing, AppEvent::EditorSave { .. } | AppEvent::EditorCancelled) => {
+                state = AppState::Idle;
+            }
+            (_, AppEvent::TrayQuit) => {
+                break;
+            }
+            _ => {} // ignore invalid transitions
         }
     }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = self.tx.send(MainCmd::Quit);
-    }
-}
-
-impl ScreenshotApp {
-    fn detect_mode(&self) -> CaptureMode {
-        CaptureMode::Region
-    }
-}
-
-fn generate_filename(format: &str) -> String {
-    let ext = if format == "png" { "png" } else { "jpg" };
-    let now = chrono_now();
-    format!("screenshot_{}_{}_{}_{}_{}_{}.{}",
-        now.year, now.month, now.day,
-        now.hour, now.minute, now.second,
-        ext,
-    )
-}
-
-struct Tm {
-    year: u32, month: u32, day: u32,
-    hour: u32, minute: u32, second: u32,
-}
-
-fn chrono_now() -> Tm {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let secs_per_day = 86400;
-    let days = d / secs_per_day as u64;
-
-    let mut y = 1970i64;
-    let mut remaining = days as i64;
-
-    loop {
-        let days_in_year = if is_leap(y) { 366 } else { 365 };
-        if remaining < days_in_year { break; }
-        remaining -= days_in_year;
-        y += 1;
-    }
-
-    let leap = is_leap(y);
-    let mdays = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m = 0;
-    while m < 12 && remaining >= mdays[m] {
-        remaining -= mdays[m];
-        m += 1;
-    }
-
-    let day = remaining + 1;
-    let sec_rem = d % secs_per_day;
-    let hour = (sec_rem / 3600) as u32;
-    let minute = ((sec_rem % 3600) / 60) as u32;
-    let second = (sec_rem % 60) as u32;
-
-    Tm {
-        year: y as u32,
-        month: (m + 1) as u32,
-        day: day as u32,
-        hour, minute, second,
-    }
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }

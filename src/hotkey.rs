@@ -1,80 +1,42 @@
-use windows::Win32::UI::WindowsAndMessaging::{RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, VK_SNAPSHOT};
+use anyhow::{Context, Result};
+use std::sync::mpsc::Sender;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_SHIFT,
+    VK_A, VK_R, VK_W,
+};
 
-use crate::app_state::CaptureMode;
-use crate::config::Config;
+use crate::event::AppEvent;
 
-pub struct HotkeyEntry {
-    pub id: u32,
-    pub mode: CaptureMode,
+pub const ID_HOTKEY_REGION: i32 = 1;
+pub const ID_HOTKEY_ACTIVE: i32 = 2;
+pub const ID_HOTKEY_PICK: i32   = 3;
+
+pub fn register_all(msg_hwnd: HWND) -> Result<()> {
+    unsafe {
+        RegisterHotKey(msg_hwnd, ID_HOTKEY_REGION, MOD_ALT | MOD_SHIFT, VK_R.0 as u32)
+            .context("RegisterHotKey R")?;
+        RegisterHotKey(msg_hwnd, ID_HOTKEY_ACTIVE, MOD_ALT | MOD_SHIFT, VK_A.0 as u32)
+            .context("RegisterHotKey A")?;
+        RegisterHotKey(msg_hwnd, ID_HOTKEY_PICK,   MOD_ALT | MOD_SHIFT, VK_W.0 as u32)
+            .context("RegisterHotKey W")?;
+    }
+    Ok(())
 }
 
-pub fn parse_and_register(hwnd: isize, config: &Config) -> Vec<HotkeyEntry> {
-    let mut entries = Vec::new();
-    let hwnd = std::mem::transmute(hwnd);
-
-    if let Some((mods, vk)) = parse_hotkey_str(&config.hotkeys.fullscreen) {
-        let id = 1;
-        if unsafe { RegisterHotKey(hwnd, id, mods, vk).is_ok() } {
-            entries.push(HotkeyEntry { id, mode: CaptureMode::FullScreen });
-        }
-    }
-
-    if let Some((mods, vk)) = parse_hotkey_str(&config.hotkeys.active_window) {
-        let id = 2;
-        if unsafe { RegisterHotKey(hwnd, id, mods, vk).is_ok() } {
-            entries.push(HotkeyEntry { id, mode: CaptureMode::ActiveWindow });
-        }
-    }
-
-    if let Some((mods, vk)) = parse_hotkey_str(&config.hotkeys.region) {
-        let id = 3;
-        if unsafe { RegisterHotKey(hwnd, id, mods, vk).is_ok() } {
-            entries.push(HotkeyEntry { id, mode: CaptureMode::Region });
-        }
-    }
-
-    if let Some((mods, vk)) = parse_hotkey_str(&config.hotkeys.select_window) {
-        let id = 4;
-        if unsafe { RegisterHotKey(hwnd, id, mods, vk).is_ok() } {
-            entries.push(HotkeyEntry { id, mode: CaptureMode::SelectWindow });
-        }
-    }
-
-    entries
-}
-
-pub fn unregister_all(hwnd: isize, entries: &[HotkeyEntry]) {
-    let hwnd = std::mem::transmute(hwnd);
-    for entry in entries {
-        unsafe { let _ = UnregisterHotKey(hwnd, entry.id); }
+pub fn unregister_all(msg_hwnd: HWND) {
+    unsafe {
+        let _ = UnregisterHotKey(msg_hwnd, ID_HOTKEY_REGION);
+        let _ = UnregisterHotKey(msg_hwnd, ID_HOTKEY_ACTIVE);
+        let _ = UnregisterHotKey(msg_hwnd, ID_HOTKEY_PICK);
     }
 }
 
-fn parse_hotkey_str(s: &str) -> Option<(u32, u16)> {
-    let parts: Vec<&str> = s.split('+').collect();
-    let mut modifiers = 0u32;
-    let mut key = None;
-
-    for part in &parts {
-        match *part {
-            "Ctrl" => modifiers |= MOD_CONTROL.0,
-            "Alt" => modifiers |= MOD_ALT.0,
-            "Shift" => modifiers |= MOD_SHIFT.0,
-            "Win" => modifiers |= MOD_WIN.0,
-            "PrintScreen" => key = Some(VK_SNAPSHOT.0 as u16),
-            other => {
-                key = Some(char_to_vk(other.chars().next()?)?);
-            }
-        }
-    }
-
-    Some((modifiers, key?))
-}
-
-fn char_to_vk(c: char) -> Option<u16> {
-    match c {
-        'A'..='Z' => Some(c as u16),
-        '0'..='9' => Some(c as u16),
-        _ => None,
+pub fn handle_wm_hotkey(id: i32, tx: &Sender<AppEvent>) {
+    match id {
+        ID_HOTKEY_REGION => { let _ = tx.send(AppEvent::CaptureRegion); }
+        ID_HOTKEY_ACTIVE => { let _ = tx.send(AppEvent::CaptureActiveWindow); }
+        ID_HOTKEY_PICK   => { let _ = tx.send(AppEvent::CapturePickWindow); }
+        _ => {}
     }
 }

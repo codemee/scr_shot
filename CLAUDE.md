@@ -135,6 +135,30 @@ SetWindowLongW(hwnd, GWL_STYLE, style | WS_HSCROLL.0 as i32);
 SetWindowPos(hwnd, None, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
 ```
 
+### 工具列沉浸式風格
+
+`TOOLBAR_BG: u32 = 0x00_F0_F0_F0` 作為工具列背景色。
+- WM_PAINT 開頭明確 `FillRect` 填工具列區域（WM_ERASEBKGND 回傳 1，不靠視窗背景刷自動填）
+- 非作用工具按鈕背景設成 `COLORREF(TOOLBAR_BG)`，讓 RoundRect 隱形、只留圖示
+- 作用中工具 / 按下 / 動作按鈕保留各自顏色
+
+### 下拉式顏色選取面板
+
+非模態下拉：`WS_POPUP | WS_BORDER`（無 `WS_CAPTION`），定位在 BTN_COLOR 正下方：
+
+```rust
+// 取得按鈕螢幕位置
+let btn = GetDlgItem(owner, BTN_COLOR as i32)?;
+GetWindowRect(btn, &mut btn_rc);
+// 在按鈕正下方建立面板
+CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ..., WS_POPUP | WS_BORDER | WS_VISIBLE,
+    btn_rc.left, btn_rc.bottom, win_w, win_h, ...)
+// SetCapture 收所有滑鼠事件；WM_LBUTTONDOWN 在視窗外 → 取消關閉
+SetCapture(drop);
+```
+
+**關鍵**：下拉面板 WM_LBUTTONDOWN 用 client coordinates 判斷是否在範圍內（cx<0、cy<0、cx≥win_w、cy≥win_h → 視窗外）。
+
 ### 儲存對話框（IFileSaveDialog）
 
 編輯器執行緒須先 `CoInitializeEx(None, COINIT_APARTMENTTHREADED)` 才能使用 COM。  

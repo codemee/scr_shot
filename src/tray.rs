@@ -16,7 +16,8 @@ pub const WM_TRAY: u32 = WM_APP + 1;
 const IDM_REGION:  u32 = 100;
 const IDM_ACTIVE:  u32 = 101;
 const IDM_PICK:    u32 = 102;
-const IDM_CURSOR:  u32 = 110;
+const IDM_CURSOR:    u32 = 110;
+const IDM_AUTO_COPY: u32 = 111;
 const IDM_DELAY_0: u32 = 200;
 const IDM_DELAY_1: u32 = 201;
 const IDM_DELAY_2: u32 = 202;
@@ -132,6 +133,11 @@ unsafe extern "system" fn msg_wnd_proc(
                     c.capture_cursor = !c.capture_cursor;
                     crate::config::persist_settings(&c);
                 }
+                IDM_AUTO_COPY => {
+                    let mut c = data.config.lock().unwrap();
+                    c.auto_copy = !c.auto_copy;
+                    crate::config::persist_settings(&c);
+                }
                 IDM_DELAY_0 | IDM_DELAY_1 | IDM_DELAY_2 | IDM_DELAY_3 | IDM_DELAY_5 => {
                     let mut c = data.config.lock().unwrap();
                     c.capture_delay_secs = match wp.0 as u32 {
@@ -174,10 +180,10 @@ unsafe extern "system" fn msg_wnd_proc(
 }
 
 unsafe fn show_context_menu(hwnd: HWND) {
-    let (capture_cursor, delay_secs) = {
+    let (capture_cursor, delay_secs, auto_copy) = {
         let data = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WndData);
         let c = data.config.lock().unwrap();
-        (c.capture_cursor, c.capture_delay_secs)
+        (c.capture_cursor, c.capture_delay_secs, c.auto_copy)
     };
 
     let hmenu = CreatePopupMenu().unwrap();
@@ -191,6 +197,10 @@ unsafe fn show_context_menu(hwnd: HWND) {
     // ── 擷取游標選項 ──
     let cursor_flag = if capture_cursor { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(hmenu, cursor_flag, IDM_CURSOR as usize, w!("擷取滑鼠游標"));
+
+    // ── 直接複製到剪貼簿 ──
+    let auto_copy_flag = if auto_copy { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(hmenu, auto_copy_flag, IDM_AUTO_COPY as usize, w!("直接複製到剪貼簿"));
 
     // ── 延遲子選單 ──
     let delay_menu = CreatePopupMenu().unwrap();

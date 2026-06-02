@@ -69,17 +69,16 @@ fn state_machine(
                 state = AppState::Editing;
                 let tx2  = tx.clone();
                 let dir  = save_dir.clone();
-                let (delay, cursor) = {
+                let (delay, cursor, auto_copy) = {
                     let c = config.lock().unwrap();
-                    (c.capture_delay_secs, c.capture_cursor)
+                    (c.capture_delay_secs, c.capture_cursor, c.auto_copy)
                 };
                 std::thread::spawn(move || {
-                    // 先取得目前作用中視窗的 rect（選定標的）
                     match screen::active_window_rect() {
                         Ok(rect) => {
                             if delay > 0 { overlay::show_countdown(delay, Some(rect)); }
                             match screen::capture_rect(rect, cursor) {
-                                Ok(bmp) => crate::editor::open(bmp, tx2, dir),
+                                Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir),
                                 Err(e) => {
                                     eprintln!("capture error: {e}");
                                     let _ = tx2.send(AppEvent::EditorCancelled);
@@ -99,9 +98,9 @@ fn state_machine(
                 state = AppState::Editing;
                 let tx2  = tx.clone();
                 let dir  = save_dir.clone();
-                let (delay, cursor) = {
+                let (delay, cursor, auto_copy) = {
                     let c = config.lock().unwrap();
-                    (c.capture_delay_secs, c.capture_cursor)
+                    (c.capture_delay_secs, c.capture_cursor, c.auto_copy)
                 };
                 std::thread::spawn(move || {
                     if delay > 0 {
@@ -110,7 +109,7 @@ fn state_machine(
                         std::thread::sleep(std::time::Duration::from_millis(80));
                     }
                     match screen::capture_rect(rect, cursor) {
-                        Ok(bmp) => crate::editor::open(bmp, tx2, dir),
+                        Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir),
                         Err(e) => {
                             eprintln!("capture error: {e}");
                             let _ = tx2.send(AppEvent::EditorCancelled);
@@ -124,9 +123,9 @@ fn state_machine(
                 state = AppState::Editing;
                 let tx2  = tx.clone();
                 let dir  = save_dir.clone();
-                let (delay, cursor) = {
+                let (delay, cursor, auto_copy) = {
                     let c = config.lock().unwrap();
-                    (c.capture_delay_secs, c.capture_cursor)
+                    (c.capture_delay_secs, c.capture_cursor, c.auto_copy)
                 };
                 std::thread::spawn(move || {
                     let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
@@ -137,7 +136,7 @@ fn state_machine(
                         std::thread::sleep(std::time::Duration::from_millis(80));
                     }
                     match screen::window_rect(hwnd).and_then(|r| screen::capture_rect(r, cursor)) {
-                        Ok(bmp) => crate::editor::open(bmp, tx2, dir),
+                        Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir),
                         Err(e) => {
                             eprintln!("capture error: {e}");
                             let _ = tx2.send(AppEvent::EditorCancelled);
@@ -156,4 +155,17 @@ fn state_machine(
             _ => {}
         }
     }
+}
+
+/// 捕獲後：若 auto_copy 先複製到剪貼簿，然後一律開啟編輯器
+fn dispatch_capture(
+    bmp: crate::capture::screen::ScreenBitmap,
+    auto_copy: bool,
+    tx: std::sync::mpsc::Sender<crate::event::AppEvent>,
+    dir: std::path::PathBuf,
+) {
+    if auto_copy {
+        let _ = crate::output::clipboard::copy_to_clipboard(&bmp);
+    }
+    crate::editor::open(bmp, tx, dir);
 }

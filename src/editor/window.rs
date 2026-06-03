@@ -458,7 +458,9 @@ unsafe extern "system" fn editor_wnd_proc(
                 }
                 _ => {}
             }
-            InvalidateRect(hwnd, None, false);
+            // 只刷畫布區域（TOOLBAR_H 以下），避免工具列重繪閃爍
+            InvalidateRect(hwnd, Some(&RECT { left: 0, top: TOOLBAR_H,
+                right: 32767, bottom: 32767 }), false);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -519,7 +521,8 @@ unsafe extern "system" fn editor_wnd_proc(
             let canvas_dc  = CreateCompatibleDC(screen_dc);
             let canvas_bmp = CreateCompatibleBitmap(screen_dc, state.canvas.width, state.canvas.height);
             let old_canvas = SelectObject(canvas_dc, canvas_bmp);
-            state.canvas.render(canvas_dc, screen_dc);
+            state.canvas.render(canvas_dc, screen_dc,
+                state.active_tool == Tool::Crop);
 
             // 計算 canvas 在 client 中的可見像素數（scroll 後剩多少）
             let vis_w = (state.canvas.width  - state.scroll_x).min(client_w).max(0);
@@ -574,21 +577,25 @@ unsafe extern "system" fn editor_wnd_proc(
             let hdc = dis.hDC;
             let rc = dis.rcItem;
 
-            // 繪製圓角矩形背景
-            let pen   = CreatePen(PS_SOLID, 0, bg);
-            let brush = CreateSolidBrush(bg);
-            let old_p = SelectObject(hdc, pen);
-            let old_b = SelectObject(hdc, brush);
-            RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
-            SelectObject(hdc, old_p);
-            SelectObject(hdc, old_b);
-            DeleteObject(pen);
-            DeleteObject(brush);
+            // 背景：作用/按下 → FillRect（無框線色塊）；其他 → RoundRect
+            if is_active_tool || is_pressed {
+                let brush = CreateSolidBrush(bg);
+                FillRect(hdc, &rc, brush);
+                DeleteObject(brush);
+            } else {
+                let pen   = CreatePen(PS_SOLID, 0, bg);
+                let brush = CreateSolidBrush(bg);
+                let old_p = SelectObject(hdc, pen);
+                let old_b = SelectObject(hdc, brush);
+                RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+                SelectObject(hdc, old_p); SelectObject(hdc, old_b);
+                DeleteObject(pen); DeleteObject(brush);
+            }
 
-            // 圖示（以 GDI 繪製，置中於按鈕）
+            // 圖示（縮小版，筆寬 1px，座標約縮 35%）
             let cx = (rc.left + rc.right) / 2;
             let cy = (rc.top + rc.bottom) / 2;
-            let ip = CreatePen(PS_SOLID, 2, text_color);
+            let ip = CreatePen(PS_SOLID, 1, text_color);
             let ib = CreateSolidBrush(text_color);
             let op = SelectObject(hdc, ip);
             let ob = SelectObject(hdc, ib);
@@ -596,96 +603,78 @@ unsafe extern "system" fn editor_wnd_proc(
 
             match id {
                 BTN_PEN => {
-                    // 斜線筆身 + 三角筆尖
-                    let _ = Polyline(hdc, &[POINT{x:cx-8,y:cy-8}, POINT{x:cx+4,y:cy+4}]);
+                    let _ = Polyline(hdc, &[POINT{x:cx-5,y:cy-5}, POINT{x:cx+3,y:cy+3}]);
                     let _ = Polygon(hdc, &[
-                        POINT{x:cx+4,y:cy+4}, POINT{x:cx+9,y:cy+1}, POINT{x:cx+1,y:cy+9},
+                        POINT{x:cx+3,y:cy+3}, POINT{x:cx+6,y:cy+1}, POINT{x:cx+1,y:cy+6},
                     ]);
                 }
                 BTN_ARROW => {
-                    // 水平線 + 右箭頭
-                    let _ = Polyline(hdc, &[POINT{x:cx-10,y:cy}, POINT{x:cx+3,y:cy}]);
+                    let _ = Polyline(hdc, &[POINT{x:cx-7,y:cy}, POINT{x:cx+2,y:cy}]);
                     let _ = Polygon(hdc, &[
-                        POINT{x:cx+3,y:cy-6}, POINT{x:cx+11,y:cy}, POINT{x:cx+3,y:cy+6},
+                        POINT{x:cx+2,y:cy-4}, POINT{x:cx+7,y:cy}, POINT{x:cx+2,y:cy+4},
                     ]);
                 }
                 BTN_RECT => {
-                    // 空心矩形
                     let o = SelectObject(hdc, nb);
-                    let _ = GdiRectangle(hdc, cx-10, cy-7, cx+10, cy+7);
+                    let _ = GdiRectangle(hdc, cx-7, cy-5, cx+7, cy+5);
                     SelectObject(hdc, o);
                 }
                 BTN_TEXT => {
-                    let _ = MoveToEx(hdc, cx-9, cy-8, None); let _ = LineTo(hdc, cx+9, cy-8);
-                    let _ = MoveToEx(hdc, cx,   cy-8, None); let _ = LineTo(hdc, cx,   cy+8);
+                    let _ = MoveToEx(hdc, cx-6, cy-5, None); let _ = LineTo(hdc, cx+6, cy-5);
+                    let _ = MoveToEx(hdc, cx,   cy-5, None); let _ = LineTo(hdc, cx,   cy+5);
                 }
                 BTN_COLOR => {
-                    // 底部粗色條（帶淺灰邊框確保白色也可見）+ 小 ▼
-                    let bar_l = rc.left + 5;
-                    let bar_r = rc.right - 5;
-                    let bar_t = rc.bottom - 9;
+                    // 底部色條（窄一點）+ 小 ▼
+                    let bar_l = rc.left + 7;
+                    let bar_r = rc.right - 7;
+                    let bar_t = rc.bottom - 8;
                     let bar_b = rc.bottom - 4;
-                    // 灰色邊框（比色條多 1px）
                     let border = CreateSolidBrush(COLORREF(0x00_A0_A0_A0));
-                    FillRect(hdc, &RECT { left: bar_l - 1, top: bar_t - 1,
-                        right: bar_r + 1, bottom: bar_b + 1 }, border);
+                    FillRect(hdc, &RECT { left: bar_l-1, top: bar_t-1,
+                        right: bar_r+1, bottom: bar_b+1 }, border);
                     DeleteObject(border);
-                    // 彩色條
                     let cb = CreateSolidBrush(COLORREF(state.canvas.tool_color));
                     FillRect(hdc, &RECT { left: bar_l, top: bar_t, right: bar_r, bottom: bar_b }, cb);
                     DeleteObject(cb);
-                    // 小 ▼（在色條正上方居中）
                     let ap = CreatePen(PS_SOLID, 1, COLORREF(0x00_40_40_40));
                     let ab = CreateSolidBrush(COLORREF(0x00_40_40_40));
-                    let top = SelectObject(hdc, ap);
-                    let tob = SelectObject(hdc, ab);
+                    let top = SelectObject(hdc, ap); let tob = SelectObject(hdc, ab);
                     let _ = Polygon(hdc, &[
-                        POINT { x: cx - 4, y: cy - 2 },
-                        POINT { x: cx + 4, y: cy - 2 },
-                        POINT { x: cx,     y: cy + 2 },
+                        POINT{x:cx-3,y:cy-2}, POINT{x:cx+3,y:cy-2}, POINT{x:cx,y:cy+1},
                     ]);
                     SelectObject(hdc, top); SelectObject(hdc, tob);
                     DeleteObject(ap); DeleteObject(ab);
                 }
                 BTN_CROP => {
-                    // 經典裁切圖示：矩形 + 四角延伸線
-                    let o = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-                    let _ = GdiRectangle(hdc, cx-7, cy-7, cx+7, cy+7);
+                    let o = SelectObject(hdc, nb);
+                    let _ = GdiRectangle(hdc, cx-5, cy-5, cx+5, cy+5);
                     SelectObject(hdc, o);
-                    let _ = MoveToEx(hdc, cx-7, cy-11, None); let _ = LineTo(hdc, cx-7, cy-7);
-                    let _ = MoveToEx(hdc, cx-11,cy-7,  None); let _ = LineTo(hdc, cx-7, cy-7);
-                    let _ = MoveToEx(hdc, cx+7, cy-11, None); let _ = LineTo(hdc, cx+7, cy-7);
-                    let _ = MoveToEx(hdc, cx+11,cy-7,  None); let _ = LineTo(hdc, cx+7, cy-7);
-                    let _ = MoveToEx(hdc, cx-7, cy+11, None); let _ = LineTo(hdc, cx-7, cy+7);
-                    let _ = MoveToEx(hdc, cx-11,cy+7,  None); let _ = LineTo(hdc, cx-7, cy+7);
-                    let _ = MoveToEx(hdc, cx+7, cy+11, None); let _ = LineTo(hdc, cx+7, cy+7);
-                    let _ = MoveToEx(hdc, cx+11,cy+7,  None); let _ = LineTo(hdc, cx+7, cy+7);
+                    let _ = MoveToEx(hdc, cx-5, cy-8, None); let _ = LineTo(hdc, cx-5, cy-5);
+                    let _ = MoveToEx(hdc, cx-8, cy-5, None); let _ = LineTo(hdc, cx-5, cy-5);
+                    let _ = MoveToEx(hdc, cx+5, cy-8, None); let _ = LineTo(hdc, cx+5, cy-5);
+                    let _ = MoveToEx(hdc, cx+8, cy-5, None); let _ = LineTo(hdc, cx+5, cy-5);
+                    let _ = MoveToEx(hdc, cx-5, cy+8, None); let _ = LineTo(hdc, cx-5, cy+5);
+                    let _ = MoveToEx(hdc, cx-8, cy+5, None); let _ = LineTo(hdc, cx-5, cy+5);
+                    let _ = MoveToEx(hdc, cx+5, cy+8, None); let _ = LineTo(hdc, cx+5, cy+5);
+                    let _ = MoveToEx(hdc, cx+8, cy+5, None); let _ = LineTo(hdc, cx+5, cy+5);
                 }
                 BTN_COPY => {
-                    // 兩個偏移的空心矩形
                     let o = SelectObject(hdc, nb);
-                    let _ = GdiRectangle(hdc, cx-9, cy-3, cx+4, cy+9);
-                    let _ = GdiRectangle(hdc, cx-4, cy-9, cx+9, cy+3);
+                    let _ = GdiRectangle(hdc, cx-6, cy-2, cx+2, cy+6);
+                    let _ = GdiRectangle(hdc, cx-2, cy-6, cx+6, cy+2);
                     SelectObject(hdc, o);
                 }
                 BTN_SAVE => {
-                    // 向下箭頭 + 底線
-                    let _ = MoveToEx(hdc, cx, cy-9, None); let _ = LineTo(hdc, cx, cy);
+                    let _ = MoveToEx(hdc, cx, cy-5, None); let _ = LineTo(hdc, cx, cy);
                     let _ = Polygon(hdc, &[
-                        POINT{x:cx-7,y:cy}, POINT{x:cx,y:cy+8}, POINT{x:cx+7,y:cy},
+                        POINT{x:cx-4,y:cy}, POINT{x:cx,y:cy+5}, POINT{x:cx+4,y:cy},
                     ]);
-                    let _ = MoveToEx(hdc, cx-10, cy+10, None); let _ = LineTo(hdc, cx+10, cy+10);
+                    let _ = MoveToEx(hdc, cx-5, cy+7, None); let _ = LineTo(hdc, cx+5, cy+7);
                 }
                 BTN_UNDO => {
-                    // 上半圓弧（從右到左，逆時針）= 標準 undo 外形
-                    let _ = GdiArc(hdc, cx-9, cy-8, cx+9, cy+8,
-                        cx+9, cy,   // 起點：右中
-                        cx-9, cy);  // 終點：左中
-                    // 箭頭尖端朝下（弧線在左中結束，方向向下）
+                    let _ = GdiArc(hdc, cx-6, cy-5, cx+6, cy+5, cx+6, cy, cx-6, cy);
                     let _ = Polygon(hdc, &[
-                        POINT{x:cx-9,  y:cy+6}, // 尖端
-                        POINT{x:cx-14, y:cy},   // 左底
-                        POINT{x:cx-4,  y:cy},   // 右底
+                        POINT{x:cx-6,y:cy+3}, POINT{x:cx-8,y:cy}, POINT{x:cx-4,y:cy},
                     ]);
                 }
                 _ => {}

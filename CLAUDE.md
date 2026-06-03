@@ -141,6 +141,7 @@ SetWindowPos(hwnd, None, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECH
 - WM_PAINT 開頭明確 `FillRect` 填工具列區域（WM_ERASEBKGND 回傳 1，不靠視窗背景刷自動填）
 - 非作用工具按鈕背景設成 `COLORREF(TOOLBAR_BG)`，讓 RoundRect 隱形、只留圖示
 - 作用中工具 / 按下 / 動作按鈕保留各自顏色
+- **WM_MOUSEMOVE 的 `InvalidateRect` 只刷畫布區域**（`top=TOOLBAR_H`），避免繪圖時工具列閃爍
 
 ### 下拉式顏色選取面板
 

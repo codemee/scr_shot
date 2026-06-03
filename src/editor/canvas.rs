@@ -46,7 +46,8 @@ impl Canvas {
     }
 
     /// Render everything onto `hdc` (should be a compat DC of the same size).
-    pub unsafe fn render(&self, hdc: HDC, screen_dc: HDC) {
+    /// `crop_mode`：裁切工具拖曳中，current stroke 改用固定白色 1px（與繪圖顏色無關）
+    pub unsafe fn render(&self, hdc: HDC, screen_dc: HDC, crop_mode: bool) {
         // Paint base bitmap into hdc via a temp DC
         let mem_dc = CreateCompatibleDC(screen_dc);
         let bmp = bgra_to_hbitmap(screen_dc, &self.base);
@@ -63,7 +64,13 @@ impl Canvas {
 
         // Draw in-progress stroke
         if let Some(ref s) = self.current {
-            s.draw(hdc, Color(self.tool_color), self.tool_thickness);
+            if crop_mode {
+                // 雙層框線：黑色外框 + 白色內框，任何背景下都可見
+                s.draw(hdc, Color(0x00_00_00_00), 3);
+                s.draw(hdc, Color(0x00_FF_FF_FF), 1);
+            } else {
+                s.draw(hdc, Color(self.tool_color), self.tool_thickness);
+            }
         }
     }
 
@@ -133,7 +140,7 @@ impl Canvas {
             let bmp = CreateCompatibleBitmap(screen_dc, self.width, self.height);
             let old = SelectObject(mem_dc, bmp);
 
-            self.render(mem_dc, screen_dc);
+            self.render(mem_dc, screen_dc, false);
 
             // Read back pixels
             let mut info = windows::Win32::Graphics::Gdi::BITMAPINFO {

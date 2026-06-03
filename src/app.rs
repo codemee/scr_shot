@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::{overlay, screen};
@@ -13,26 +14,29 @@ enum AppState {
     Idle,
     OverlayRegion,
     OverlayPick,
-    Editing,
 }
 
 pub fn run(config: Config) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<AppEvent>();
-    let config   = Arc::new(Mutex::new(config));
+    let config      = Arc::new(Mutex::new(config));
+    let editor_hwnd = Arc::new(Mutex::new(Option::<isize>::None));
 
     let msg_hwnd = tray::create_message_window(tx.clone(), config.clone());
     hotkey::register_all(msg_hwnd)?;
     let _tray = tray::make_tray(msg_hwnd);
 
-    let tx2       = tx.clone();
-    let save_dir  = { config.lock().unwrap().save_dir.clone() };
-    let config_sm = config.clone();
+    let tx2          = tx.clone();
+    let save_dir     = { config.lock().unwrap().save_dir.clone() };
+    let config_sm    = config.clone();
+    let editor_sm    = editor_hwnd.clone();
 
-    std::thread::spawn(move || state_machine(rx, tx2, save_dir, config_sm));
+    std::thread::spawn(move || {
+        state_machine(rx, tx2, save_dir, config_sm, editor_sm);
+    });
 
     unsafe {
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, windows::Win32::Foundation::HWND(std::ptr::null_mut()), 0, 0).as_bool() {
+        while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -47,12 +51,12 @@ fn state_machine(
     tx: Sender<AppEvent>,
     save_dir: std::path::PathBuf,
     config: Arc<Mutex<Config>>,
+    editor_hwnd: Arc<Mutex<Option<isize>>>,
 ) {
     let mut state = AppState::Idle;
 
     for event in rx {
         match (&state, event) {
-            // ── Overlay 立刻出現，不延遲 ──────────────────────────────
             (AppState::Idle, AppEvent::CaptureRegion) => {
                 state = AppState::OverlayRegion;
                 let tx2 = tx.clone();
@@ -63,45 +67,36 @@ fn state_machine(
                 let tx2 = tx.clone();
                 std::thread::spawn(move || overlay::show_pick(tx2));
             }
-
-            // ── 作用中視窗：先鎖定視窗，再延遲後截圖 ─────────────────
             (AppState::Idle, AppEvent::CaptureActiveWindow) => {
-                state = AppState::Editing;
                 let tx2  = tx.clone();
                 let dir  = save_dir.clone();
                 let (delay, cursor, auto_copy) = {
                     let c = config.lock().unwrap();
                     (c.capture_delay_secs, c.capture_cursor, c.auto_copy)
                 };
+                let editor_clone = editor_hwnd.clone();
                 std::thread::spawn(move || {
                     match screen::active_window_rect() {
                         Ok(rect) => {
                             if delay > 0 { overlay::show_countdown(delay, Some(rect)); }
                             match screen::capture_rect(rect, cursor) {
-                                Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir),
-                                Err(e) => {
-                                    eprintln!("capture error: {e}");
-                                    let _ = tx2.send(AppEvent::EditorCancelled);
-                                }
+                                Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir, editor_clone),
+                                Err(e) => { eprintln!("capture error: {e}"); }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("capture error: {e}");
-                            let _ = tx2.send(AppEvent::EditorCancelled);
-                        }
+                        Err(e) => { eprintln!("capture error: {e}"); }
                     }
                 });
             }
-
-            // ── 框選完成：延遲後截圖 ──────────────────────────────────
             (AppState::OverlayRegion, AppEvent::RegionSelected(rect)) => {
-                state = AppState::Editing;
+                state = AppState::Idle;
                 let tx2  = tx.clone();
                 let dir  = save_dir.clone();
                 let (delay, cursor, auto_copy) = {
                     let c = config.lock().unwrap();
                     (c.capture_delay_secs, c.capture_cursor, c.auto_copy)
                 };
+                let editor_clone = editor_hwnd.clone();
                 std::thread::spawn(move || {
                     if delay > 0 {
                         overlay::show_countdown(delay, Some(rect));
@@ -109,24 +104,20 @@ fn state_machine(
                         std::thread::sleep(std::time::Duration::from_millis(80));
                     }
                     match screen::capture_rect(rect, cursor) {
-                        Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir),
-                        Err(e) => {
-                            eprintln!("capture error: {e}");
-                            let _ = tx2.send(AppEvent::EditorCancelled);
-                        }
+                        Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir, editor_clone),
+                        Err(e) => { eprintln!("capture error: {e}"); }
                     }
                 });
             }
-
-            // ── 點選視窗完成：延遲後截圖 ─────────────────────────────
             (AppState::OverlayPick, AppEvent::WindowPicked(hwnd_raw)) => {
-                state = AppState::Editing;
+                state = AppState::Idle;
                 let tx2  = tx.clone();
                 let dir  = save_dir.clone();
                 let (delay, cursor, auto_copy) = {
                     let c = config.lock().unwrap();
                     (c.capture_delay_secs, c.capture_cursor, c.auto_copy)
                 };
+                let editor_clone = editor_hwnd.clone();
                 std::thread::spawn(move || {
                     let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
                     if delay > 0 {
@@ -136,36 +127,75 @@ fn state_machine(
                         std::thread::sleep(std::time::Duration::from_millis(80));
                     }
                     match screen::window_rect(hwnd).and_then(|r| screen::capture_rect(r, cursor)) {
-                        Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir),
-                        Err(e) => {
-                            eprintln!("capture error: {e}");
-                            let _ = tx2.send(AppEvent::EditorCancelled);
-                        }
+                        Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir, editor_clone),
+                        Err(e) => { eprintln!("capture error: {e}"); }
                     }
                 });
             }
-
             (AppState::OverlayRegion | AppState::OverlayPick, AppEvent::OverlayCancelled) => {
                 state = AppState::Idle;
             }
-            (AppState::Editing, AppEvent::EditorSave { .. } | AppEvent::EditorCancelled) => {
-                state = AppState::Idle;
+            // EditorSave/EditorCancelled: 舊架構保留，在持久視窗模式下可忽略
+            (_, AppEvent::EditorSave { .. } | AppEvent::EditorCancelled) => {}
+            (_, AppEvent::ShowEditor) => {
+                // 雙按系統匣：顯示編輯視窗
+                let hwnd_val = { *editor_hwnd.lock().unwrap() };
+                if let Some(v) = hwnd_val {
+                    unsafe {
+                        let hw = HWND(v as *mut _);
+                        if IsWindow(hw).as_bool() {
+                            PostMessageW(hw, crate::editor::WM_SHOW_EDITOR, WPARAM(0), LPARAM(0)).ok();
+                        }
+                    }
+                }
             }
-            (_, AppEvent::TrayQuit) => break,
+            (_, AppEvent::TrayQuit) => {
+                // 通知編輯器執行緒強制結束
+                let hwnd_val = { *editor_hwnd.lock().unwrap() };
+                if let Some(v) = hwnd_val {
+                    unsafe {
+                        let hw = HWND(v as *mut _);
+                        if IsWindow(hw).as_bool() {
+                            PostMessageW(hw, crate::editor::WM_FORCE_QUIT, WPARAM(0), LPARAM(0)).ok();
+                        }
+                    }
+                }
+                break;
+            }
             _ => {}
         }
     }
 }
 
-/// 捕獲後：若 auto_copy 先複製到剪貼簿，然後一律開啟編輯器
+/// 捕獲後：auto_copy 先複製剪貼簿；送到既有編輯器或新建
 fn dispatch_capture(
     bmp: crate::capture::screen::ScreenBitmap,
     auto_copy: bool,
-    tx: std::sync::mpsc::Sender<crate::event::AppEvent>,
+    tx: Sender<AppEvent>,
     dir: std::path::PathBuf,
+    editor_hwnd: Arc<Mutex<Option<isize>>>,
 ) {
     if auto_copy {
         let _ = crate::output::clipboard::copy_to_clipboard(&bmp);
     }
-    crate::editor::open(bmp, tx, dir);
+
+    let hwnd_val = { *editor_hwnd.lock().unwrap() };
+    if let Some(v) = hwnd_val {
+        unsafe {
+            let hw = HWND(v as *mut _);
+            if IsWindow(hw).as_bool() {
+                // 傳遞 heap 上的 bmp；editor 負責 Box::from_raw
+                let ptr = Box::into_raw(Box::new(bmp));
+                PostMessageW(hw, crate::editor::WM_NEW_TAB,
+                    WPARAM(0), LPARAM(ptr as isize)).ok();
+                return;
+            }
+        }
+    }
+
+    // 編輯器尚未存在，建立持久視窗
+    let editor_hwnd_clone = editor_hwnd.clone();
+    std::thread::spawn(move || {
+        crate::editor::open(bmp, tx, dir, editor_hwnd_clone);
+    });
 }

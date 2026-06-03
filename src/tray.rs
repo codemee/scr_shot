@@ -119,6 +119,9 @@ unsafe extern "system" fn msg_wnd_proc(
             let event = lp.0 as u32 & 0xFFFF;
             if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                 show_context_menu(hwnd);
+            } else if event == WM_LBUTTONDBLCLK {
+                let data = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WndData);
+                let _ = data.tx.send(AppEvent::ShowEditor);
             }
             LRESULT(0)
         }

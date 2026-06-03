@@ -177,6 +177,29 @@ Undo 系統採 `UndoOp` enum：
 
 新增筆畫須呼叫 `canvas.push_stroke(stroke, color, thickness)`（同步維護 undo_ops），**不可**直接 push 到 `canvas.strokes`。
 
+### 多分頁編輯器
+
+每次截圖開一個新分頁，視窗以持久方式存在（`WM_CLOSE` 只隱藏）。
+
+- `WM_NEW_TAB = WM_APP+2`：app 傳 `Box<ScreenBitmap>` raw ptr，editor 建立新分頁
+- `WM_FORCE_QUIT = WM_APP+3`：TrayQuit 時送出，editor 真正銷毀
+- `WM_SHOW_EDITOR = WM_APP+4`：雙按系統匣圖示，帶視窗到前景
+- Editor HWND 存於 `Arc<Mutex<Option<isize>>>`，共享給 app.rs state machine
+- 標籤列：`CreateRoundRectRgn` + `IntersectClipRect` 裁切到標籤列範圍 → 上方圓角、平底
+- Tooltip 使用 `WS_EX_LAYERED | WS_EX_NOACTIVATE`，`SetWindowPos` 加 `SWP_NOACTIVATE`：
+  不觸發下方 WM_PAINT，不搶奪焦點（避免編輯視窗陰影消失）
+
+### 防閃爍（進階）
+
+`WM_PAINT` 雙條件：
+
+```rust
+if ps.rcPaint.top < CANVAS_Y  { /* 工具列＋標籤列 */ }
+if ps.rcPaint.bottom > CANVAS_Y { /* Canvas::render */ }
+```
+
+所有只影響畫布的 `InvalidateRect` 使用 `Some(&RECT{top:CANVAS_Y,...})`，**不呼叫 `update_scrollbars`**（普通筆畫不改變畫布尺寸），避免 `SWP_FRAMECHANGED` 污染髒區域。
+
 ### 倒數計時（show_countdown）
 
 `overlay::show_countdown(seconds, highlight: Option<RECT>)` 在執行緒中同步阻塞 N 秒。

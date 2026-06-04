@@ -4,10 +4,10 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
+    CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
     DrawTextW, EndPaint, FillRect, FillRgn, FrameRgn, GetDC, GetStockObject,
     IntersectClipRect, InvalidateRect,
-    Arc as GdiArc, LineTo, MoveToEx, NULL_BRUSH, Polygon, Polyline,
+    Arc as GdiArc, Ellipse, LineTo, MoveToEx, NULL_BRUSH, Polygon, Polyline,
     Rectangle as GdiRectangle, ReleaseDC, RestoreDC, RoundRect, SaveDC,
     SelectObject, SetBkMode,
     BACKGROUND_MODE, DEFAULT_GUI_FONT, DRAW_TEXT_FORMAT, HRGN, PAINTSTRUCT,
@@ -29,7 +29,7 @@ pub const WM_SHOW_EDITOR: u32 = 0x8004; // app → editor：顯示並帶到前�
 
 const TAB_H:    i32 = 28;              // 分頁列高度
 const CANVAS_Y: i32 = TAB_H + TOOLBAR_H; // 畫布起始 y（= 76）
-const TAB_W:    i32 = 130;             // 每個分頁的寬度
+const TAB_W:    i32 = 148;             // 每個分頁的寬度（日期時間戳記 Consolas 需要更多空間）
 const TOOLBAR_H: i32 = 48;
 const TOOLBAR_BG: u32 = 0x00_F0_F0_F0; // 工具列背景色（沉浸式風格）
 const BTN_W: i32 = 40;
@@ -42,9 +42,10 @@ const BTN_RECT: usize  = 12;
 const BTN_TEXT: usize  = 13;
 const BTN_CROP:  usize = 14;
 const BTN_COLOR: usize = 15;
-const BTN_COPY:  usize = 20;
-const BTN_SAVE: usize  = 21;
-const BTN_UNDO: usize  = 22;
+const BTN_COPY:    usize = 20;
+const BTN_SAVE:    usize = 21;
+const BTN_SAVEAS:  usize = 23;
+const BTN_UNDO:    usize = 22;
 
 /// 每個分頁各自擁有的狀態
 struct TabInfo {
@@ -54,6 +55,8 @@ struct TabInfo {
     scroll_y: i32,
     result_sent: bool,
     name: String,
+    saved_path: Option<std::path::PathBuf>, // 已存檔的完整路徑；再次存檔時直接覆蓋
+    modified: bool, // 有未存的修改（新截圖 = false，使用者編輯後 = true）
 }
 
 /// 整個編輯器視窗的狀態
@@ -70,6 +73,7 @@ struct EditorState {
     tooltip: HWND,
     hover_btn: i32,
     hover_ticks: i32,
+    tab_scroll: usize, // 標籤列捲動偏移（第一個可見標籤的索引）
     editor_hwnd_arc: std::sync::Arc<std::sync::Mutex<Option<isize>>>,
 }
 
@@ -105,7 +109,7 @@ pub fn open(
         let canvas = Canvas::new(bmp);
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let min_w = BTN_MARGIN + 9 * (BTN_W + BTN_MARGIN) + 20;
+        let min_w = BTN_MARGIN + 10 * (BTN_W + BTN_MARGIN) + 20;
         let min_h = CANVAS_Y + 120;
         let win_w = (canvas.width + 20).max(min_w).min(screen_w * 9 / 10);
         let win_h = (canvas.height + CANVAS_Y + 45).max(min_h).min(screen_h * 9 / 10);
@@ -116,7 +120,12 @@ pub fn open(
             scroll_x: 0,
             scroll_y: 0,
             result_sent: false,
-            name: "截圖 1".to_string(),
+            name: {
+                let st = windows::Win32::System::SystemInformation::GetLocalTime();
+                format!("{}{:02}{:02}{:02}{:02}{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond)
+            },
+            saved_path: None,
+            modified: false,
         };
         let state = Box::new(EditorState {
             tx,
@@ -131,6 +140,7 @@ pub fn open(
             tooltip: HWND(std::ptr::null_mut()),
             hover_btn: -1,
             hover_ticks: 0,
+            tab_scroll: 0,
             editor_hwnd_arc: editor_hwnd_arc.clone(),
         });
 
@@ -208,7 +218,7 @@ pub fn open(
 
 unsafe fn create_toolbar(parent: HWND) {
     let hinstance = get_instance();
-    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_UNDO]
+    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_SAVEAS, BTN_UNDO]
         .iter().enumerate()
     {
         let x = BTN_MARGIN + i as i32 * (BTN_W + BTN_MARGIN);
@@ -395,6 +405,9 @@ unsafe extern "system" fn editor_wnd_proc(
                 }
                 BTN_UNDO  => {
                     state.tabs[state.active_tab].canvas.undo();
+                    if !state.tabs[state.active_tab].modified {
+                        state.tabs[state.active_tab].modified = true;
+                    }
                     // 裁切復原後畫布可能變大，捲軸需重算
                     state.tabs[state.active_tab].scroll_x = state.tabs[state.active_tab].scroll_x.min((state.tabs[state.active_tab].canvas.width  - 1).max(0));
                     state.tabs[state.active_tab].scroll_y = state.tabs[state.active_tab].scroll_y.min((state.tabs[state.active_tab].canvas.height - 1).max(0));
@@ -411,22 +424,83 @@ unsafe extern "system" fn editor_wnd_proc(
                 }
                 BTN_SAVE => {
                     let flat = state.tabs[state.active_tab].canvas.flatten_to_bitmap();
-                    if let Some(path) = show_save_dialog(hwnd, &state.tabs[state.active_tab].save_dir) {
+                    // 已有儲存路徑 → 直接覆蓋；否則開對話框
+                    let existing = state.tabs[state.active_tab].saved_path.clone();
+                    let chosen = if let Some(ref p) = existing {
+                        Some(p.clone())
+                    } else {
+                        // 首次存檔：以時間戳記（標籤名稱）為預設檔名
+                        let tab_name = state.tabs[state.active_tab].name.clone();
+                        show_save_dialog(hwnd, &state.tabs[state.active_tab].save_dir, &tab_name)
+                    };
+                    if let Some(path) = chosen {
                         let _ = crate::output::file::save_png(&flat, &path);
+                        // 更新目錄記錄
                         if let Some(parent) = path.parent() {
-                            state.tabs[state.active_tab].save_dir = parent.to_path_buf();
-                            crate::config::persist_save_dir(&state.tabs[state.active_tab].save_dir);
+                            let dir = parent.to_path_buf();
+                            state.tabs[state.active_tab].save_dir = dir.clone();
+                            state.default_save_dir = dir.clone();
+                            crate::config::persist_save_dir(&dir);
                         }
+                        // 標籤名稱改成檔名（不含副檔名）
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            state.tabs[state.active_tab].name = stem.to_string();
+                        }
+                        // 記錄完整路徑供下次覆蓋
+                        state.tabs[state.active_tab].saved_path = Some(path.clone());
+                        state.tabs[state.active_tab].modified = false;
                         let _ = state.tx.send(AppEvent::EditorSave { to_clipboard: false, path: Some(path) });
                         state.tabs[state.active_tab].result_sent = true;
-                        { let i = state.active_tab; close_tab(hwnd, state, i); }
+                        // 不關閉分頁，讓使用者繼續編輯
+                        update_scrollbars(hwnd, state);
+                        InvalidateRect(hwnd, None, false);
+                        SetFocus(hwnd);
                     }
-                    // 使用者取消對話框時不關閉編輯器
+                    // 使用者取消對話框時不做任何事
+                }
+                BTN_SAVEAS => {
+                    // 另存新檔：僅對已存過的標籤有效
+                    if state.tabs[state.active_tab].saved_path.is_none() { return LRESULT(0); }
+                    let flat = state.tabs[state.active_tab].canvas.flatten_to_bitmap();
+                    // 另存新檔：以現有檔名為預設
+                    let current_stem = state.tabs[state.active_tab].saved_path.as_ref()
+                        .and_then(|p| p.file_stem())
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&state.tabs[state.active_tab].name)
+                        .to_string();
+                    if let Some(path) = show_save_dialog(hwnd, &state.tabs[state.active_tab].save_dir, &current_stem) {
+                        let _ = crate::output::file::save_png(&flat, &path);
+                        if let Some(parent) = path.parent() {
+                            let dir = parent.to_path_buf();
+                            state.tabs[state.active_tab].save_dir = dir.clone();
+                            state.default_save_dir = dir.clone();
+                            crate::config::persist_save_dir(&dir);
+                        }
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            state.tabs[state.active_tab].name = stem.to_string();
+                        }
+                        state.tabs[state.active_tab].saved_path = Some(path.clone());
+                        state.tabs[state.active_tab].modified = false;
+                        let _ = state.tx.send(AppEvent::EditorSave { to_clipboard: false, path: Some(path) });
+                        state.tabs[state.active_tab].result_sent = true;
+                        update_scrollbars(hwnd, state);
+                        InvalidateRect(hwnd, None, false);
+                        SetFocus(hwnd);
+                    }
                 }
                 // 下拉選單分頁切換（ID 2000 ~ 2999）
                 id if id >= 2000 && id < 2000 + state.tabs.len() => {
                     state.active_tab = id - 2000;
                     state.dragging = false;
+                    // 確保選取的標籤在可見範圍
+                    let mut rc2 = RECT::default();
+                    GetClientRect(hwnd, &mut rc2).ok();
+                    let mv = ((rc2.right - 22) / TAB_W).max(1) as usize;
+                    if state.active_tab < state.tab_scroll {
+                        state.tab_scroll = state.active_tab;
+                    } else if state.active_tab >= state.tab_scroll + mv {
+                        state.tab_scroll = state.active_tab + 1 - mv;
+                    }
                     update_scrollbars(hwnd, state);
                     InvalidateRect(hwnd, None, false);
                 }
@@ -469,10 +543,12 @@ unsafe extern "system" fn editor_wnd_proc(
                     return LRESULT(0);
                 }
 
-                let vis = if show_drop { max_vis } else { state.tabs.len() };
-                let idx = (cx / TAB_W) as usize;
-                if idx < vis {
-                    let tx0 = idx as i32 * TAB_W;
+                let tab_scr = state.tab_scroll.min(state.tabs.len().saturating_sub(1));
+                let vis_count = (tab_scr + max_vis).min(state.tabs.len()) - tab_scr;
+                let slot = (cx / TAB_W) as usize;  // 點擊的視覺格子（0 起）
+                let idx = slot + tab_scr;           // 實際標籤索引
+                if slot < vis_count {
+                    let tx0 = slot as i32 * TAB_W;
                     let tw  = TAB_W;
                     if cx >= tx0 + tw - 18 {
                         close_tab(hwnd, state, idx);
@@ -503,6 +579,9 @@ unsafe extern "system" fn editor_wnd_proc(
                             Stroke::Text { pos: pt, text },
                             super::tool::Color(c), t,
                         ));
+                        if !state.tabs[state.active_tab].modified {
+                            state.tabs[state.active_tab].modified = true;
+                        }
                         InvalidateRect(hwnd, None, false);
                     }
                 }
@@ -564,6 +643,9 @@ unsafe extern "system" fn editor_wnd_proc(
                             state.tabs[state.active_tab].canvas.crop(r);
                             state.tabs[state.active_tab].scroll_x = 0;
                             state.tabs[state.active_tab].scroll_y = 0;
+                            if !state.tabs[state.active_tab].modified {
+                                state.tabs[state.active_tab].modified = true;
+                            }
                         }
                     }
                     state.tabs[state.active_tab].canvas.current = None;
@@ -578,6 +660,11 @@ unsafe extern "system" fn editor_wnd_proc(
                     state.tabs[state.active_tab].canvas.push_stroke(
                         stroke, super::tool::Color(c), t,
                     );
+                    if !state.tabs[state.active_tab].modified {
+                        state.tabs[state.active_tab].modified = true;
+                        // 首次修改：刷新標籤列以立即顯示紅點
+                        InvalidateRect(hwnd, Some(&RECT{left:0,top:TOOLBAR_H,right:32767,bottom:CANVAS_Y}), false);
+                    }
                     // 一般筆畫不改變畫布尺寸，只刷畫布區，不呼叫 update_scrollbars
                     // 避免 SWP_FRAMECHANGED 污染髒區域造成標籤閃爍
                     InvalidateRect(hwnd, Some(&RECT{left:0,top:CANVAS_Y,right:32767,bottom:32767}), false);
@@ -613,8 +700,9 @@ unsafe extern "system" fn editor_wnd_proc(
             // 下拉按鈕寬度（標籤太多時顯示）
             const DROP_W: i32 = 22;
             let max_tabs_visible = ((client_w - DROP_W) / TAB_W).max(1) as usize;
-            let show_drop = state.tabs.len() > max_tabs_visible;
-            let visible_end = if show_drop { max_tabs_visible } else { state.tabs.len() };
+            let tab_scroll = state.tab_scroll.min(state.tabs.len().saturating_sub(1));
+            let visible_end = (tab_scroll + max_tabs_visible).min(state.tabs.len());
+            let show_drop = state.tabs.len() > max_tabs_visible || tab_scroll > 0;
 
             let r = 8i32;  // 圓角半徑
             let ty = TOOLBAR_H + 2;
@@ -623,9 +711,9 @@ unsafe extern "system" fn editor_wnd_proc(
             let saved_dc = SaveDC(hdc);
             IntersectClipRect(hdc, 0, TOOLBAR_H, client_w.max(1), CANVAS_Y);
 
-            for i in 0..visible_end {
+            for i in tab_scroll..visible_end {
                 let tab = &state.tabs[i];
-                let tx0 = i as i32 * TAB_W;   // 緊靠前一個標籤，無間距
+                let tx0 = (i - tab_scroll) as i32 * TAB_W;  // 相對於捲動偏移的位置
                 let tw  = TAB_W;               // 全寬
                 let is_active = i == state.active_tab;
                 let fill_c = COLORREF(if is_active { TOOLBAR_BG } else { 0x00_C8_C8_C8 });
@@ -640,16 +728,32 @@ unsafe extern "system" fn editor_wnd_proc(
 
                 DeleteObject(HRGN(rgn.0));
 
-                // 文字
+                // 文字（Consolas 等寬字型，適合時間戳記）
                 SetBkMode(hdc, BACKGROUND_MODE(1));
                 windows::Win32::Graphics::Gdi::SetTextColor(hdc,
                     COLORREF(if is_active { 0x00_10_10_10 } else { 0x00_50_50_50 }));
-                let font = GetStockObject(DEFAULT_GUI_FONT);
-                let of = SelectObject(hdc, font);
+                let show_dot = tab.saved_path.is_none() || tab.modified;
+                // 有紅點時縮短文字區域，避免疊字
+                let text_right = if show_dot { tx0 + tw - 30 } else { tx0 + tw - 19 };
+                let tab_font = CreateFontW(-13, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, w!("Consolas"));
+                let of = SelectObject(hdc, tab_font);
                 let mut nw: Vec<u16> = tab.name.encode_utf16().collect();
-                let mut nrc = RECT{left:tx0+6, top:ty, right:tx0+tw-20, bottom:CANVAS_Y};
+                let mut nrc = RECT{left:tx0+5, top:ty, right:text_right, bottom:CANVAS_Y};
                 DrawTextW(hdc, &mut nw, &mut nrc, DRAW_TEXT_FORMAT(0x25));
                 SelectObject(hdc, of);
+                DeleteObject(tab_font);
+                // 紅點：位於文字右側、× 左側
+                if show_dot {
+                    let rp = CreatePen(PS_SOLID, 0, COLORREF(0x00_00_00_CC));
+                    let rb = CreateSolidBrush(COLORREF(0x00_00_00_CC));
+                    let op = SelectObject(hdc, rp);
+                    let ob = SelectObject(hdc, rb);
+                    let dot_x = tx0 + tw - 25; // × 左側
+                    let dot_y = (ty + CANVAS_Y) / 2;
+                    Ellipse(hdc, dot_x - 4, dot_y - 4, dot_x + 4, dot_y + 4);
+                    SelectObject(hdc, op); SelectObject(hdc, ob);
+                    DeleteObject(rp); DeleteObject(rb);
+                }
                 // ×
                 windows::Win32::Graphics::Gdi::SetTextColor(hdc, COLORREF(0x00_70_70_70));
                 let of2 = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
@@ -750,7 +854,10 @@ unsafe extern "system" fn editor_wnd_proc(
                     _         => COLORREF(TOOLBAR_BG), // 與工具列同色，只顯示圖示
                 }
             };
+            let saveas_disabled = id == BTN_SAVEAS
+                && state.tabs[state.active_tab].saved_path.is_none();
             let text_color = match id {
+                _ if saveas_disabled => windows::Win32::Foundation::COLORREF(0x00_C0_C0_C0), // 禁用灰
                 _ if is_active_tool || is_pressed => windows::Win32::Foundation::COLORREF(0x00_FF_FF_FF),
                 _ => windows::Win32::Foundation::COLORREF(0x00_40_40_40),
             };
@@ -845,6 +952,17 @@ unsafe extern "system" fn editor_wnd_proc(
                     ]);
                     let _ = MoveToEx(hdc, cx-5, cy+7, None); let _ = LineTo(hdc, cx+5, cy+7);
                 }
+                BTN_SAVEAS => {
+                    // 儲存圖示 + 右上角 + 號（代表另存新檔）
+                    let _ = MoveToEx(hdc, cx-2, cy-4, None); let _ = LineTo(hdc, cx-2, cy+1);
+                    let _ = Polygon(hdc, &[
+                        POINT{x:cx-6,y:cy+1}, POINT{x:cx-2,y:cy+6}, POINT{x:cx+2,y:cy+1},
+                    ]);
+                    let _ = MoveToEx(hdc, cx-7, cy+8, None); let _ = LineTo(hdc, cx+3, cy+8);
+                    // 右上 + 號
+                    let _ = MoveToEx(hdc, cx+5, cy-7, None); let _ = LineTo(hdc, cx+5, cy-3);
+                    let _ = MoveToEx(hdc, cx+3, cy-5, None); let _ = LineTo(hdc, cx+7, cy-5);
+                }
                 BTN_UNDO => {
                     let _ = GdiArc(hdc, cx-6, cy-5, cx+6, cy+5, cx+6, cy, cx-6, cy);
                     let _ = Polygon(hdc, &[
@@ -868,8 +986,8 @@ unsafe extern "system" fn editor_wnd_proc(
             let btn_hover: i32 = if under.is_invalid() { -1 } else {
                 match GetDlgCtrlID(under) as usize {
                     BTN_PEN   => 0, BTN_ARROW => 1, BTN_RECT  => 2, BTN_TEXT  => 3,
-                    BTN_CROP  => 4, BTN_COLOR => 5, BTN_COPY  => 6, BTN_SAVE  => 7,
-                    BTN_UNDO  => 8, _ => -1,
+                    BTN_CROP  => 4, BTN_COLOR => 5, BTN_COPY  => 6, BTN_SAVE   => 7,
+                    BTN_SAVEAS => 8, BTN_UNDO => 9, _ => -1,
                 }
             };
             if btn_hover != state.hover_btn {
@@ -879,7 +997,7 @@ unsafe extern "system" fn editor_wnd_proc(
             } else if btn_hover >= 0 {
                 state.hover_ticks += 1;
                 if state.hover_ticks == 5 { // 5×100ms = 500ms 後顯示
-                    let labels = ["筆","箭頭","矩形","文字","裁切","顏色","複製","儲存","復原"];
+                    let labels = ["筆","箭頭","矩形","文字","裁切","顏色","複製","儲存","另存","復原"];
                     if let Some(label) = labels.get(btn_hover as usize) {
                         let text: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
                         SetWindowTextW(state.tooltip, windows::core::PCWSTR(text.as_ptr())).ok();
@@ -935,10 +1053,24 @@ unsafe extern "system" fn editor_wnd_proc(
                     save_dir: state.default_save_dir.clone(),
                     scroll_x: 0, scroll_y: 0,
                     result_sent: false,
-                    name: format!("截圖 {}", state.tab_counter),
+                    name: {
+                        let st = windows::Win32::System::SystemInformation::GetLocalTime();
+                        format!("{}{:02}{:02}{:02}{:02}{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond)
+                    },
+                    saved_path: None,
+            modified: false,
                 });
                 state.active_tab = state.tabs.len() - 1;
                 state.dragging = false;
+                // 捲動到新標籤（讓既有標籤往左移）
+                {
+                    let mut rc_tmp = RECT::default();
+                    GetClientRect(hwnd, &mut rc_tmp).ok();
+                    let mv = ((rc_tmp.right - 22) / TAB_W).max(1) as usize;
+                    if state.active_tab >= state.tab_scroll + mv {
+                        state.tab_scroll = state.active_tab + 1 - mv;
+                    }
+                }
                 SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW).ok();
                 SetForegroundWindow(hwnd).ok();
                 SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE).ok();
@@ -1102,7 +1234,8 @@ unsafe fn simple_input_dialog(parent: HWND) -> String {
 }
 
 /// 顯示系統另存新檔對話框，回傳使用者選擇的路徑；取消則回傳 None
-unsafe fn show_save_dialog(owner: HWND, initial_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+/// `default_name`：對話框預設檔名（不含副檔名）
+unsafe fn show_save_dialog(owner: HWND, initial_dir: &std::path::Path, default_name: &str) -> Option<std::path::PathBuf> {
     use windows::Win32::System::Com::{CoCreateInstance, IBindCtx, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Shell::{
         FileSaveDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
@@ -1114,12 +1247,8 @@ unsafe fn show_save_dialog(owner: HWND, initial_dir: &std::path::Path) -> Option
     // 預設副檔名（若使用者未輸入則自動補上）
     let _ = dialog.SetDefaultExtension(w!("png"));
 
-    // 預設檔名（時間戳記）
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let fname: Vec<u16> = format!("srcshot_{}.png\0", ts).encode_utf16().collect();
+    // 預設檔名（呼叫端傳入）
+    let fname: Vec<u16> = format!("{}.png\0", default_name).encode_utf16().collect();
     let _ = dialog.SetFileName(windows::core::PCWSTR(fname.as_ptr()));
 
     // 起始資料夾（上次儲存位置）

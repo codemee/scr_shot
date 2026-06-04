@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **產品名稱：ezshot**（系統匣圖示名稱、視窗標題前綴、README 均已更新）
+
 ## Build & Run
 
 ```powershell
@@ -176,6 +178,10 @@ Undo 系統採 `UndoOp` enum：
 - `UndoOp::Crop { snapshot }` → 還原整個 canvas 狀態
 
 新增筆畫須呼叫 `canvas.push_stroke(stroke, color, thickness)`（同步維護 undo_ops），**不可**直接 push 到 `canvas.strokes`。
+
+### 編輯視窗標題
+
+`update_window_title(hwnd, state)` 在每次切換分頁、儲存、關閉分頁時呼叫，格式為 `ezshot-<tab.name>`。
 
 ### 多分頁編輯器
 

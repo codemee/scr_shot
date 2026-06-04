@@ -36,6 +36,20 @@ const BTN_W: i32 = 40;
 const BTN_H: i32 = 36;
 const BTN_MARGIN: i32 = 4;
 
+// 右鍵選單指令（3000 起，不與分頁切換 2000+ 衝突）
+const CM_CAPTURE_REGION:  u32 = 3001;
+const CM_CAPTURE_ACTIVE:  u32 = 3002;
+const CM_CAPTURE_PICK:    u32 = 3003;
+const CM_TOGGLE_CURSOR:   u32 = 3010;
+const CM_TOGGLE_AUTOCOPY: u32 = 3011;
+const CM_DELAY_0:  u32 = 3200; const CM_DELAY_1: u32 = 3201;
+const CM_DELAY_2:  u32 = 3202; const CM_DELAY_3: u32 = 3203;
+const CM_DELAY_5:  u32 = 3205; const CM_DELAY_CUSTOM: u32 = 3210;
+const CM_TOGGLE_HIDE_ON_CAPTURE: u32 = 3012;
+const CM_QUIT:     u32 = 3099;
+
+const BTN_SETTINGS: usize = 25; // 設定按鈕（≡）
+
 const BTN_PEN: usize   = 10;
 const BTN_ARROW: usize = 11;
 const BTN_RECT: usize  = 12;
@@ -73,8 +87,9 @@ struct EditorState {
     tooltip: HWND,
     hover_btn: i32,
     hover_ticks: i32,
-    tab_scroll: usize, // 標籤列捲動偏移（第一個可見標籤的索引）
+    tab_scroll: usize,
     editor_hwnd_arc: std::sync::Arc<std::sync::Mutex<Option<isize>>>,
+    config: std::sync::Arc<std::sync::Mutex<crate::config::Config>>,
 }
 
 pub fn open(
@@ -82,6 +97,7 @@ pub fn open(
     tx: Sender<AppEvent>,
     save_dir: std::path::PathBuf,
     editor_hwnd_arc: std::sync::Arc<std::sync::Mutex<Option<isize>>>,
+    config: std::sync::Arc<std::sync::Mutex<crate::config::Config>>,
 ) {
     unsafe {
         use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
@@ -109,7 +125,7 @@ pub fn open(
         let canvas = Canvas::new(bmp);
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let min_w = BTN_MARGIN + 10 * (BTN_W + BTN_MARGIN) + 20;
+        let min_w = BTN_MARGIN + 11 * (BTN_W + BTN_MARGIN) + 20;
         let min_h = CANVAS_Y + 120;
         let win_w = (canvas.width + 20).max(min_w).min(screen_w * 9 / 10);
         let win_h = (canvas.height + CANVAS_Y + 45).max(min_h).min(screen_h * 9 / 10);
@@ -142,6 +158,7 @@ pub fn open(
             hover_ticks: 0,
             tab_scroll: 0,
             editor_hwnd_arc: editor_hwnd_arc.clone(),
+            config: config.clone(),
         });
 
         let hwnd = CreateWindowExW(
@@ -166,6 +183,9 @@ pub fn open(
         *editor_hwnd_arc.lock().unwrap() = Some(hwnd.0 as isize);
 
         create_toolbar(hwnd);
+        // 設定初始視窗標題
+        let sp0 = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const EditorState;
+        if !sp0.is_null() { update_window_title(hwnd, &*sp0); }
 
         // 自製 tooltip 視窗（比 Win32 tooltip API 可靠）
         let tip_class = w!("srcshot_tipwnd");
@@ -218,7 +238,7 @@ pub fn open(
 
 unsafe fn create_toolbar(parent: HWND) {
     let hinstance = get_instance();
-    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_SAVEAS, BTN_UNDO]
+    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_SAVEAS, BTN_UNDO, BTN_SETTINGS]
         .iter().enumerate()
     {
         let x = BTN_MARGIN + i as i32 * (BTN_W + BTN_MARGIN);
@@ -449,6 +469,7 @@ unsafe extern "system" fn editor_wnd_proc(
                         // 記錄完整路徑供下次覆蓋
                         state.tabs[state.active_tab].saved_path = Some(path.clone());
                         state.tabs[state.active_tab].modified = false;
+                        update_window_title(hwnd, state);
                         let _ = state.tx.send(AppEvent::EditorSave { to_clipboard: false, path: Some(path) });
                         state.tabs[state.active_tab].result_sent = true;
                         // 不關閉分頁，讓使用者繼續編輯
@@ -481,12 +502,26 @@ unsafe extern "system" fn editor_wnd_proc(
                         }
                         state.tabs[state.active_tab].saved_path = Some(path.clone());
                         state.tabs[state.active_tab].modified = false;
+                        update_window_title(hwnd, state);
                         let _ = state.tx.send(AppEvent::EditorSave { to_clipboard: false, path: Some(path) });
                         state.tabs[state.active_tab].result_sent = true;
                         update_scrollbars(hwnd, state);
                         InvalidateRect(hwnd, None, false);
                         SetFocus(hwnd);
                     }
+                }
+                BTN_SETTINGS => {
+                    // 在按鈕正下方顯示設定選單（不含擷取功能）
+                    if let Ok(btn) = GetDlgItem(hwnd, BTN_SETTINGS as i32) {
+                        let mut btn_rc = RECT::default();
+                        GetWindowRect(btn, &mut btn_rc).ok();
+                        show_settings_popup(hwnd, state, btn_rc.left, btn_rc.bottom);
+                    }
+                    SetFocus(hwnd);
+                }
+                // 右鍵選單指令（ID 3000 ~ 3999）
+                id if id >= 3000 && id < 4000 => {
+                    handle_context_menu_cmd(hwnd, state, id as u32);
                 }
                 // 下拉選單分頁切換（ID 2000 ~ 2999）
                 id if id >= 2000 && id < 2000 + state.tabs.len() => {
@@ -502,6 +537,7 @@ unsafe extern "system" fn editor_wnd_proc(
                         state.tab_scroll = state.active_tab + 1 - mv;
                     }
                     update_scrollbars(hwnd, state);
+                    update_window_title(hwnd, state);
                     InvalidateRect(hwnd, None, false);
                 }
                 _ => {}
@@ -556,6 +592,7 @@ unsafe extern "system" fn editor_wnd_proc(
                         state.active_tab = idx;
                         state.dragging = false;
                         update_scrollbars(hwnd, state);
+                        update_window_title(hwnd, state);
                         InvalidateRect(hwnd, None, false);
                     }
                 }
@@ -969,6 +1006,13 @@ unsafe extern "system" fn editor_wnd_proc(
                         POINT{x:cx-6,y:cy+3}, POINT{x:cx-8,y:cy}, POINT{x:cx-4,y:cy},
                     ]);
                 }
+                BTN_SETTINGS => {
+                    // ≡ 三條橫線
+                    for dy in [-5i32, 0, 5] {
+                        let _ = MoveToEx(hdc, cx-7, cy+dy, None);
+                        let _ = LineTo(hdc, cx+7, cy+dy);
+                    }
+                }
                 _ => {}
             }
 
@@ -976,6 +1020,14 @@ unsafe extern "system" fn editor_wnd_proc(
             DeleteObject(ip); DeleteObject(ib);
 
             LRESULT(1)
+        }
+        // 右鍵選單：在視窗任意位置右鍵顯示捕獲/設定選單
+        WM_CONTEXTMENU => {
+            let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const EditorState);
+            let sx = (lp.0 & 0xFFFF) as i16 as i32;
+            let sy = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+            show_editor_popup(hwnd, state, sx, sy);
+            LRESULT(0)
         }
         WM_TIMER if wp.0 == 3 => {
             // 每 100ms 輪詢：用 WindowFromPoint 偵測游標在哪個按鈕上
@@ -987,7 +1039,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 match GetDlgCtrlID(under) as usize {
                     BTN_PEN   => 0, BTN_ARROW => 1, BTN_RECT  => 2, BTN_TEXT  => 3,
                     BTN_CROP  => 4, BTN_COLOR => 5, BTN_COPY  => 6, BTN_SAVE   => 7,
-                    BTN_SAVEAS => 8, BTN_UNDO => 9, _ => -1,
+                    BTN_SAVEAS => 8, BTN_UNDO => 9, BTN_SETTINGS => 10, _ => -1,
                 }
             };
             if btn_hover != state.hover_btn {
@@ -997,7 +1049,7 @@ unsafe extern "system" fn editor_wnd_proc(
             } else if btn_hover >= 0 {
                 state.hover_ticks += 1;
                 if state.hover_ticks == 5 { // 5×100ms = 500ms 後顯示
-                    let labels = ["筆","箭頭","矩形","文字","裁切","顏色","複製","儲存","另存","復原"];
+                    let labels = ["筆","箭頭","矩形","文字","裁切","顏色","複製","儲存","另存","復原","設定"];
                     if let Some(label) = labels.get(btn_hover as usize) {
                         let text: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
                         SetWindowTextW(state.tooltip, windows::core::PCWSTR(text.as_ptr())).ok();
@@ -1075,6 +1127,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 SetForegroundWindow(hwnd).ok();
                 SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE).ok();
                 update_scrollbars(hwnd, state);
+                update_window_title(hwnd, state);
                 InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
@@ -1100,6 +1153,14 @@ unsafe extern "system" fn editor_wnd_proc(
     }
 }
 
+/// 依目前作用中標籤更新視窗標題
+unsafe fn update_window_title(hwnd: HWND, state: &EditorState) {
+    if state.tabs.is_empty() { return; }
+    let title: Vec<u16> = format!("ezshot-{}\0", state.tabs[state.active_tab].name)
+        .encode_utf16().collect();
+    SetWindowTextW(hwnd, windows::core::PCWSTR(title.as_ptr())).ok();
+}
+
 /// 關閉第 idx 個分頁；無分頁時隱藏視窗
 unsafe fn close_tab(hwnd: HWND, state: &mut EditorState, idx: usize) {
     if idx >= state.tabs.len() { return; }
@@ -1113,6 +1174,7 @@ unsafe fn close_tab(hwnd: HWND, state: &mut EditorState, idx: usize) {
     }
     state.dragging = false;
     update_scrollbars(hwnd, state);
+    update_window_title(hwnd, state);
     InvalidateRect(hwnd, None, false);
 }
 
@@ -1612,6 +1674,192 @@ unsafe extern "system" fn tip_wnd_proc(
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+/// 工具列設定按鈕點擊後的設定選單（只有設定選項，不含擷取功能）
+unsafe fn show_settings_popup(hwnd: HWND, state: &EditorState, sx: i32, sy: i32) {
+    let (capture_cursor, delay_secs, auto_copy, hide_on_capture) = {
+        let c = state.config.lock().unwrap();
+        (c.capture_cursor, c.capture_delay_secs, c.auto_copy, c.hide_editor_on_capture)
+    };
+    let hmenu = CreatePopupMenu().unwrap();
+    let cf = if capture_cursor { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(hmenu, cf, CM_TOGGLE_CURSOR as usize, w!("擷取滑鼠游標"));
+    let af = if auto_copy { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(hmenu, af, CM_TOGGLE_AUTOCOPY as usize, w!("直接複製到剪貼簿"));
+    let hf = if hide_on_capture { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(hmenu, hf, CM_TOGGLE_HIDE_ON_CAPTURE as usize, w!("擷取前隱藏編輯視窗"));
+
+    let delay_menu = CreatePopupMenu().unwrap();
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_0 as usize, w!("無延遲"));
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_1 as usize, w!("1 秒"));
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_2 as usize, w!("2 秒"));
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_3 as usize, w!("3 秒"));
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_5 as usize, w!("5 秒"));
+    let is_preset = [0u32, 1, 2, 3, 5].contains(&delay_secs);
+    let custom_label: Vec<u16> = if is_preset {
+        "自訂...\0".encode_utf16().collect()
+    } else {
+        format!("自訂: {} 秒...\0", delay_secs).encode_utf16().collect()
+    };
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_CUSTOM as usize,
+        windows::core::PCWSTR(custom_label.as_ptr()));
+    let cur_id = match delay_secs { 1=>CM_DELAY_1, 2=>CM_DELAY_2, 3=>CM_DELAY_3, 5=>CM_DELAY_5, _=>CM_DELAY_0 };
+    let _ = CheckMenuRadioItem(delay_menu, CM_DELAY_0, CM_DELAY_5, cur_id, MF_BYCOMMAND.0);
+    if !is_preset { let _ = CheckMenuItem(delay_menu, CM_DELAY_CUSTOM, MF_BYCOMMAND.0 | MF_CHECKED.0); }
+    let _ = AppendMenuW(hmenu, MF_POPUP, delay_menu.0 as usize, w!("延遲擷取"));
+
+    SetForegroundWindow(hwnd).ok();
+    TrackPopupMenu(hmenu, TPM_RIGHTBUTTON, sx, sy, 0, hwnd, None);
+    let _ = DestroyMenu(hmenu);
+}
+
+/// 在編輯視窗顯示右鍵選單（捕獲方式 + 設定），與系統匣選單功能相同
+unsafe fn show_editor_popup(hwnd: HWND, state: &EditorState, sx: i32, sy: i32) {
+    let (capture_cursor, delay_secs, auto_copy) = {
+        let c = state.config.lock().unwrap();
+        (c.capture_cursor, c.capture_delay_secs, c.auto_copy)
+    };
+
+    let hmenu = CreatePopupMenu().unwrap();
+    // ── 捕獲方式 ──
+    let _ = AppendMenuW(hmenu, MF_STRING, CM_CAPTURE_REGION as usize, w!("框選區域 (Alt+Shift+R)"));
+    let _ = AppendMenuW(hmenu, MF_STRING, CM_CAPTURE_ACTIVE as usize, w!("作用中視窗 (Alt+Shift+A)"));
+    let _ = AppendMenuW(hmenu, MF_STRING, CM_CAPTURE_PICK   as usize, w!("點選視窗 (Alt+Shift+W)"));
+    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
+    // ── 設定 ──
+    let cf = if capture_cursor { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(hmenu, cf, CM_TOGGLE_CURSOR as usize, w!("擷取滑鼠游標"));
+    let af = if auto_copy { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(hmenu, af, CM_TOGGLE_AUTOCOPY as usize, w!("直接複製到剪貼簿"));
+    // ── 延遲子選單 ──
+    let delay_menu = CreatePopupMenu().unwrap();
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_0 as usize, w!("無延遲"));
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_1 as usize, w!("1 秒"));
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_2 as usize, w!("2 秒"));
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_3 as usize, w!("3 秒"));
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_5 as usize, w!("5 秒"));
+    let is_preset = [0u32, 1, 2, 3, 5].contains(&delay_secs);
+    let custom_label: Vec<u16> = if is_preset {
+        "自訂...\0".encode_utf16().collect()
+    } else {
+        format!("自訂: {} 秒...\0", delay_secs).encode_utf16().collect()
+    };
+    let _ = AppendMenuW(delay_menu, MF_STRING, CM_DELAY_CUSTOM as usize,
+        windows::core::PCWSTR(custom_label.as_ptr()));
+    let current_delay_id = match delay_secs { 1=>CM_DELAY_1, 2=>CM_DELAY_2, 3=>CM_DELAY_3, 5=>CM_DELAY_5, _=>CM_DELAY_0 };
+    let _ = CheckMenuRadioItem(delay_menu, CM_DELAY_0, CM_DELAY_5, current_delay_id, MF_BYCOMMAND.0);
+    if !is_preset { let _ = CheckMenuItem(delay_menu, CM_DELAY_CUSTOM, MF_BYCOMMAND.0 | MF_CHECKED.0); }
+    let _ = AppendMenuW(hmenu, MF_POPUP, delay_menu.0 as usize, w!("延遲擷取"));
+    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
+    let _ = AppendMenuW(hmenu, MF_STRING, CM_QUIT as usize, w!("結束"));
+
+    SetForegroundWindow(hwnd).ok();
+    TrackPopupMenu(hmenu, TPM_RIGHTBUTTON, sx, sy, 0, hwnd, None);
+    let _ = DestroyMenu(hmenu);
+}
+
+/// 處理來自右鍵選單的 WM_COMMAND
+unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) {
+    match id {
+        CM_CAPTURE_REGION => { let _ = state.tx.send(crate::event::AppEvent::CaptureRegion); }
+        CM_CAPTURE_ACTIVE => { let _ = state.tx.send(crate::event::AppEvent::CaptureActiveWindow); }
+        CM_CAPTURE_PICK   => { let _ = state.tx.send(crate::event::AppEvent::CapturePickWindow); }
+        CM_TOGGLE_CURSOR  => {
+            let mut c = state.config.lock().unwrap();
+            c.capture_cursor = !c.capture_cursor;
+            crate::config::persist_settings(&c);
+        }
+        CM_TOGGLE_AUTOCOPY => {
+            let mut c = state.config.lock().unwrap();
+            c.auto_copy = !c.auto_copy;
+            crate::config::persist_settings(&c);
+        }
+        CM_TOGGLE_HIDE_ON_CAPTURE => {
+            let mut c = state.config.lock().unwrap();
+            c.hide_editor_on_capture = !c.hide_editor_on_capture;
+            crate::config::persist_settings(&c);
+        }
+        CM_DELAY_0 | CM_DELAY_1 | CM_DELAY_2 | CM_DELAY_3 | CM_DELAY_5 => {
+            let mut c = state.config.lock().unwrap();
+            c.capture_delay_secs = match id {
+                CM_DELAY_1 => 1, CM_DELAY_2 => 2, CM_DELAY_3 => 3, CM_DELAY_5 => 5, _ => 0,
+            };
+            crate::config::persist_settings(&c);
+        }
+        CM_DELAY_CUSTOM => {
+            // 重用自訂延遲輸入框
+            let current = state.config.lock().unwrap().capture_delay_secs;
+            // 用 custom_color_input_dialog 的樣板建立數字輸入
+            let config_arc = state.config.clone();
+            let class = w!("srcshot_delaydlg2");
+            let hinstance = get_instance();
+            struct DS { value: u32, confirmed: bool, done: bool }
+            unsafe extern "system" fn dp(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+                match msg {
+                    WM_NCCREATE => { let cs = &*(lp.0 as *const CREATESTRUCTW); SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as _); LRESULT(1) }
+                    WM_CREATE => {
+                        let hi = {
+                            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+                            windows::Win32::Foundation::HINSTANCE::from(GetModuleHandleW(None).unwrap())
+                        };
+                        CreateWindowExW(Default::default(), w!("STATIC"), w!("延遲秒數（0–99）："), WS_CHILD|WS_VISIBLE, 8,10,200,18, hwnd, HMENU(std::ptr::null_mut()), hi, None).ok();
+                        let edit = CreateWindowExW(WS_EX_CLIENTEDGE, w!("EDIT"), w!(""), WS_CHILD|WS_VISIBLE|WINDOW_STYLE(0x2000u32), 8,32,80,24, hwnd, HMENU(1usize as _), hi, None).unwrap();
+                        CreateWindowExW(Default::default(), w!("BUTTON"), w!("確定"), WS_CHILD|WS_VISIBLE|WINDOW_STYLE(BS_DEFPUSHBUTTON as u32), 8,64,80,28, hwnd, HMENU(2usize as _), hi, None).ok();
+                        CreateWindowExW(Default::default(), w!("BUTTON"), w!("取消"), WS_CHILD|WS_VISIBLE, 96,64,80,28, hwnd, HMENU(3usize as _), hi, None).ok();
+                        let s = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const DS);
+                        let pre: Vec<u16> = format!("{}\0", s.value).encode_utf16().collect();
+                        SetWindowTextW(edit, windows::core::PCWSTR(pre.as_ptr())).ok();
+                        PostMessageW(hwnd, WM_NEXTDLGCTL, WPARAM(edit.0 as usize), LPARAM(1)).ok();
+                        LRESULT(0)
+                    }
+                    WM_COMMAND if (wp.0 & 0xFFFF) == 2 => {
+                        let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS);
+                        if let Ok(edit) = GetDlgItem(hwnd, 1) {
+                            let n = GetWindowTextLengthW(edit) + 1;
+                            let mut buf = vec![0u16; n as usize];
+                            GetWindowTextW(edit, &mut buf);
+                            s.value = String::from_utf16_lossy(&buf).trim_end_matches('\0').parse::<u32>().unwrap_or(0).min(99);
+                        }
+                        s.confirmed = true; s.done = true; DestroyWindow(hwnd).ok(); LRESULT(0)
+                    }
+                    WM_COMMAND if (wp.0 & 0xFFFF) == 3 => { let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS); s.done = true; DestroyWindow(hwnd).ok(); LRESULT(0) }
+                    WM_CLOSE => { let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS); s.done = true; DestroyWindow(hwnd).ok(); LRESULT(0) }
+                    WM_DESTROY => LRESULT(0),
+                    _ => DefWindowProcW(hwnd, msg, wp, lp),
+                }
+            }
+            let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, lpfnWndProc: Some(dp), hInstance: hinstance, lpszClassName: class, ..Default::default() };
+            let _ = RegisterClassExW(&wc);
+            let mut ds = DS { value: current, confirmed: false, done: false };
+            let dlg = CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_TOPMOST, class, w!("自訂延遲秒數"), WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 200, 140, hwnd, HMENU(std::ptr::null_mut()), hinstance, Some(&mut ds as *mut _ as _)).unwrap_or(HWND(std::ptr::null_mut()));
+            if !dlg.0.is_null() {
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
+                    if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_RETURN.0 as usize {
+                        if let Ok(edit) = GetDlgItem(dlg, 1) {
+                            let n = GetWindowTextLengthW(edit) + 1;
+                            let mut buf = vec![0u16; n as usize];
+                            GetWindowTextW(edit, &mut buf);
+                            ds.value = String::from_utf16_lossy(&buf).trim_end_matches('\0').parse::<u32>().unwrap_or(0).min(99);
+                        }
+                        ds.confirmed = true; ds.done = true; DestroyWindow(dlg).ok(); break;
+                    }
+                    if IsDialogMessageW(dlg, &msg).as_bool() { if ds.done { break; } continue; }
+                    let _ = TranslateMessage(&msg); DispatchMessageW(&msg);
+                    if ds.done { break; }
+                }
+            }
+            let _ = UnregisterClassW(class, hinstance);
+            if ds.confirmed {
+                let mut c = config_arc.lock().unwrap();
+                c.capture_delay_secs = ds.value;
+                crate::config::persist_settings(&c);
+            }
+        }
+        CM_QUIT => { let _ = state.tx.send(crate::event::AppEvent::TrayQuit); }
+        _ => {}
     }
 }
 

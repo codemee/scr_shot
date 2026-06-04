@@ -16,8 +16,9 @@ pub const WM_TRAY: u32 = WM_APP + 1;
 const IDM_REGION:  u32 = 100;
 const IDM_ACTIVE:  u32 = 101;
 const IDM_PICK:    u32 = 102;
-const IDM_CURSOR:    u32 = 110;
-const IDM_AUTO_COPY: u32 = 111;
+const IDM_CURSOR:         u32 = 110;
+const IDM_AUTO_COPY:      u32 = 111;
+const IDM_HIDE_ON_CAPTURE: u32 = 112;
 const IDM_DELAY_0: u32 = 200;
 const IDM_DELAY_1: u32 = 201;
 const IDM_DELAY_2: u32 = 202;
@@ -44,7 +45,7 @@ impl Tray {
             nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
             nid.uCallbackMessage = WM_TRAY;
             nid.hIcon = self.icon;
-            let tip = "srcshot";
+            let tip = "ezshot";
             let bytes: Vec<u16> = tip.encode_utf16().chain(std::iter::once(0)).collect();
             let len = bytes.len().min(128);
             nid.szTip[..len].copy_from_slice(&bytes[..len]);
@@ -141,6 +142,11 @@ unsafe extern "system" fn msg_wnd_proc(
                     c.auto_copy = !c.auto_copy;
                     crate::config::persist_settings(&c);
                 }
+                IDM_HIDE_ON_CAPTURE => {
+                    let mut c = data.config.lock().unwrap();
+                    c.hide_editor_on_capture = !c.hide_editor_on_capture;
+                    crate::config::persist_settings(&c);
+                }
                 IDM_DELAY_0 | IDM_DELAY_1 | IDM_DELAY_2 | IDM_DELAY_3 | IDM_DELAY_5 => {
                     let mut c = data.config.lock().unwrap();
                     c.capture_delay_secs = match wp.0 as u32 {
@@ -183,10 +189,10 @@ unsafe extern "system" fn msg_wnd_proc(
 }
 
 unsafe fn show_context_menu(hwnd: HWND) {
-    let (capture_cursor, delay_secs, auto_copy) = {
+    let (capture_cursor, delay_secs, auto_copy, hide_on_capture) = {
         let data = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WndData);
         let c = data.config.lock().unwrap();
-        (c.capture_cursor, c.capture_delay_secs, c.auto_copy)
+        (c.capture_cursor, c.capture_delay_secs, c.auto_copy, c.hide_editor_on_capture)
     };
 
     let hmenu = CreatePopupMenu().unwrap();
@@ -204,6 +210,8 @@ unsafe fn show_context_menu(hwnd: HWND) {
     // ── 直接複製到剪貼簿 ──
     let auto_copy_flag = if auto_copy { MF_STRING | MF_CHECKED } else { MF_STRING };
     let _ = AppendMenuW(hmenu, auto_copy_flag, IDM_AUTO_COPY as usize, w!("直接複製到剪貼簿"));
+    let hide_flag = if hide_on_capture { MF_STRING | MF_CHECKED } else { MF_STRING };
+    let _ = AppendMenuW(hmenu, hide_flag, IDM_HIDE_ON_CAPTURE as usize, w!("擷取前隱藏編輯視窗"));
 
     // ── 延遲子選單 ──
     let delay_menu = CreatePopupMenu().unwrap();

@@ -4,17 +4,19 @@ pub struct Config {
     pub save_dir: PathBuf,
     pub capture_cursor: bool,
     pub capture_delay_secs: u32,
-    pub auto_copy: bool,       // 擷取後直接複製到剪貼簿，跳過編輯器
+    pub auto_copy: bool,
+    pub hide_editor_on_capture: bool, // 按快捷鍵擷取前先隱藏編輯視窗
 }
 
 impl Default for Config {
     fn default() -> Self {
-        let (cursor, delay, auto_copy) = load_settings();
+        let (cursor, delay, auto_copy, hide_on_capture) = load_settings();
         Self {
             save_dir: load_save_dir(),
             capture_cursor: cursor,
             capture_delay_secs: delay,
             auto_copy,
+            hide_editor_on_capture: hide_on_capture,
         }
     }
 }
@@ -39,13 +41,14 @@ pub fn persist_save_dir(dir: &Path) {
 
 // ── 擷取設定（由系統匣執行緒讀寫）──────────────────────────────────────
 
-fn load_settings() -> (bool, u32, bool) {
-    let mut cursor    = false;
-    let mut delay     = 0u32;
-    let mut auto_copy = false;
+fn load_settings() -> (bool, u32, bool, bool) {
+    let mut cursor          = false;
+    let mut delay           = 0u32;
+    let mut auto_copy       = false;
+    let mut hide_on_capture = false;
     let path = match config_dir().map(|p| p.join("settings.ini")) {
         Some(p) => p,
-        None => return (cursor, delay, auto_copy),
+        None => return (cursor, delay, auto_copy, hide_on_capture),
     };
     if let Ok(content) = std::fs::read_to_string(&path) {
         for line in content.lines() {
@@ -55,20 +58,23 @@ fn load_settings() -> (bool, u32, bool) {
                 delay = v.parse().unwrap_or(0);
             } else if let Some(v) = line.strip_prefix("auto_copy=") {
                 auto_copy = v == "1";
+            } else if let Some(v) = line.strip_prefix("hide_editor_on_capture=") {
+                hide_on_capture = v == "1";
             }
         }
     }
-    (cursor, delay, auto_copy)
+    (cursor, delay, auto_copy, hide_on_capture)
 }
 
 pub fn persist_settings(config: &Config) {
     if let Some(base) = config_dir() {
         let _ = std::fs::create_dir_all(&base);
         let content = format!(
-            "capture_cursor={}\ncapture_delay_secs={}\nauto_copy={}\n",
+            "capture_cursor={}\ncapture_delay_secs={}\nauto_copy={}\nhide_editor_on_capture={}\n",
             if config.capture_cursor { 1 } else { 0 },
             config.capture_delay_secs,
             if config.auto_copy { 1 } else { 0 },
+            if config.hide_editor_on_capture { 1 } else { 0 },
         );
         let _ = std::fs::write(base.join("settings.ini"), content.as_bytes());
     }

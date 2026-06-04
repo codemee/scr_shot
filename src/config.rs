@@ -85,7 +85,7 @@ pub fn persist_settings(config: &Config) {
 fn config_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
-        .map(|p| p.join("srcshot"))
+        .map(|p| p.join("ezshot"))
 }
 
 fn default_dir() -> PathBuf {

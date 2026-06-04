@@ -62,7 +62,7 @@ Windows 螢幕截圖工具，常駐系統匣，支援全域快捷鍵、截圖後
 cargo build --release
 ```
 
-產生的執行檔位於 `target\release\ezshot.exe`（建議將 Cargo.toml 的 `name` 改為 `ezshot`），無需安裝，直接執行即常駐系統匣。
+產生的執行檔位於 `target\release\ezshot.exe`，無需安裝，直接執行即常駐系統匣。
 
 ## 技術
 

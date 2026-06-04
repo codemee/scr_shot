@@ -54,8 +54,9 @@ const BTN_PEN: usize   = 10;
 const BTN_ARROW: usize = 11;
 const BTN_RECT: usize  = 12;
 const BTN_TEXT: usize  = 13;
-const BTN_CROP:  usize = 14;
-const BTN_COLOR: usize = 15;
+const BTN_CROP:   usize = 14;
+const BTN_COLOR:  usize = 15;
+const BTN_MOSAIC: usize = 17;
 const BTN_COPY:    usize = 20;
 const BTN_SAVE:    usize = 21;
 const BTN_SAVEAS:  usize = 23;
@@ -125,7 +126,7 @@ pub fn open(
         let canvas = Canvas::new(bmp);
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let min_w = BTN_MARGIN + 11 * (BTN_W + BTN_MARGIN) + 20;
+        let min_w = BTN_MARGIN + 12 * (BTN_W + BTN_MARGIN) + 20;
         let min_h = CANVAS_Y + 120;
         let win_w = (canvas.width + 20).max(min_w).min(screen_w * 9 / 10);
         let win_h = (canvas.height + CANVAS_Y + 45).max(min_h).min(screen_h * 9 / 10);
@@ -238,7 +239,7 @@ pub fn open(
 
 unsafe fn create_toolbar(parent: HWND) {
     let hinstance = get_instance();
-    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_SAVEAS, BTN_UNDO, BTN_SETTINGS]
+    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_MOSAIC, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_SAVEAS, BTN_UNDO, BTN_SETTINGS]
         .iter().enumerate()
     {
         let x = BTN_MARGIN + i as i32 * (BTN_W + BTN_MARGIN);
@@ -392,15 +393,16 @@ unsafe extern "system" fn editor_wnd_proc(
             let id = (wp.0 & 0xFFFF) as usize;
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
             match id {
-                BTN_PEN | BTN_ARROW | BTN_RECT | BTN_TEXT | BTN_CROP => {
+                BTN_PEN | BTN_ARROW | BTN_RECT | BTN_TEXT | BTN_CROP | BTN_MOSAIC => {
                     state.active_tool = match id {
-                        BTN_PEN   => Tool::Pen,
-                        BTN_ARROW => Tool::Arrow,
-                        BTN_RECT  => Tool::Rect,
-                        BTN_TEXT  => Tool::Text,
-                        _         => Tool::Crop,
+                        BTN_PEN    => Tool::Pen,
+                        BTN_ARROW  => Tool::Arrow,
+                        BTN_RECT   => Tool::Rect,
+                        BTN_TEXT   => Tool::Text,
+                        BTN_MOSAIC => Tool::Mosaic,
+                        _          => Tool::Crop,
                     };
-                    for bid in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP] {
+                    for bid in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_MOSAIC] {
                         if let Ok(btn) = GetDlgItem(hwnd, bid as i32) {
                             InvalidateRect(btn, None, false);
                         }
@@ -652,7 +654,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 Tool::Arrow => {
                     state.tabs[state.active_tab].canvas.current = Some(Stroke::Arrow { from: state.drag_start, to: pt });
                 }
-                Tool::Rect | Tool::Crop => {
+                Tool::Rect | Tool::Crop | Tool::Mosaic => {
                     let s = state.drag_start;
                     state.tabs[state.active_tab].canvas.current = Some(Stroke::Rect {
                         r: RECT {
@@ -686,9 +688,22 @@ unsafe extern "system" fn editor_wnd_proc(
                         }
                     }
                     state.tabs[state.active_tab].canvas.current = None;
-                    // 裁切改變畫布尺寸，需要重算捲軸（可能觸發 SWP_FRAMECHANGED）
                     update_scrollbars(hwnd, state);
-                    InvalidateRect(hwnd, None, false); // 裁切後全部重繪（標籤也可能有變）
+                    InvalidateRect(hwnd, None, false);
+                } else if state.active_tool == Tool::Mosaic {
+                    // 套用馬賽克
+                    if let Some(Stroke::Rect { r }) = state.tabs[state.active_tab].canvas.current.take() {
+                        if r.right - r.left > 4 && r.bottom - r.top > 4 {
+                            state.tabs[state.active_tab].canvas.apply_mosaic(r, 12);
+                            if !state.tabs[state.active_tab].modified {
+                                state.tabs[state.active_tab].modified = true;
+                                InvalidateRect(hwnd, Some(&RECT{left:0,top:TOOLBAR_H,right:32767,bottom:CANVAS_Y}), false);
+                            }
+                        }
+                    }
+                    state.tabs[state.active_tab].canvas.current = None;
+                    InvalidateRect(hwnd, Some(&RECT{left:0,top:CANVAS_Y,right:32767,bottom:32767}), false);
+                    return LRESULT(0);
                 } else if let Some(stroke) = state.tabs[state.active_tab].canvas.current.take() {
                     let (c, t) = {
                         let tab = &state.tabs[state.active_tab];
@@ -841,7 +856,7 @@ unsafe extern "system" fn editor_wnd_proc(
                     state.tabs[state.active_tab].canvas.height);
                 let old_canvas = SelectObject(canvas_dc, canvas_bmp);
                 state.tabs[state.active_tab].canvas.render(canvas_dc, screen_dc,
-                    state.active_tool == Tool::Crop);
+                    matches!(state.active_tool, Tool::Crop | Tool::Mosaic));
 
                 let vis_w = (state.tabs[state.active_tab].canvas.width
                     - state.tabs[state.active_tab].scroll_x).min(client_w).max(0);
@@ -879,7 +894,8 @@ unsafe extern "system" fn editor_wnd_proc(
                 (id == BTN_ARROW && state.active_tool == Tool::Arrow)  ||
                 (id == BTN_RECT  && state.active_tool == Tool::Rect)   ||
                 (id == BTN_TEXT  && state.active_tool == Tool::Text)   ||
-                (id == BTN_CROP  && state.active_tool == Tool::Crop);
+                (id == BTN_CROP   && state.active_tool == Tool::Crop)   ||
+                (id == BTN_MOSAIC && state.active_tool == Tool::Mosaic);
 
             // COLORREF = 0x00BBGGRR
             let bg = if is_pressed {
@@ -963,6 +979,28 @@ unsafe extern "system" fn editor_wnd_proc(
                     SelectObject(hdc, top); SelectObject(hdc, tob);
                     DeleteObject(ap); DeleteObject(ab);
                 }
+                BTN_MOSAIC => {
+                    // 3×3 像素方格（馬賽克圖示）
+                    let s = 3i32; // 每格大小
+                    let g = 2i32; // 格間距
+                    let total = 3 * s + 2 * g;
+                    let ox = cx - total / 2;
+                    let oy = cy - total / 2;
+                    for gy in 0..3i32 {
+                        for gx in 0..3i32 {
+                            let rx = ox + gx * (s + g);
+                            let ry = oy + gy * (s + g);
+                            // 棋盤交錯：奇偶格填滿或空心，製造馬賽克視覺
+                            if (gx + gy) % 2 == 0 {
+                                GdiRectangle(hdc, rx, ry, rx+s, ry+s);
+                            } else {
+                                let o = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+                                GdiRectangle(hdc, rx, ry, rx+s, ry+s);
+                                SelectObject(hdc, o);
+                            }
+                        }
+                    }
+                }
                 BTN_CROP => {
                     let o = SelectObject(hdc, nb);
                     let _ = GdiRectangle(hdc, cx-5, cy-5, cx+5, cy+5);
@@ -1038,8 +1076,8 @@ unsafe extern "system" fn editor_wnd_proc(
             let btn_hover: i32 = if under.is_invalid() { -1 } else {
                 match GetDlgCtrlID(under) as usize {
                     BTN_PEN   => 0, BTN_ARROW => 1, BTN_RECT  => 2, BTN_TEXT  => 3,
-                    BTN_CROP  => 4, BTN_COLOR => 5, BTN_COPY  => 6, BTN_SAVE   => 7,
-                    BTN_SAVEAS => 8, BTN_UNDO => 9, BTN_SETTINGS => 10, _ => -1,
+                    BTN_CROP => 4, BTN_MOSAIC => 5, BTN_COLOR => 6, BTN_COPY => 7,
+                    BTN_SAVE => 8, BTN_SAVEAS => 9, BTN_UNDO => 10, BTN_SETTINGS => 11, _ => -1,
                 }
             };
             if btn_hover != state.hover_btn {
@@ -1049,7 +1087,7 @@ unsafe extern "system" fn editor_wnd_proc(
             } else if btn_hover >= 0 {
                 state.hover_ticks += 1;
                 if state.hover_ticks == 5 { // 5×100ms = 500ms 後顯示
-                    let labels = ["筆","箭頭","矩形","文字","裁切","顏色","複製","儲存","另存","復原","設定"];
+                    let labels = ["筆","箭頭","矩形","文字","裁切","馬賽克","顏色","複製","儲存","另存","復原","設定"];
                     if let Some(label) = labels.get(btn_hover as usize) {
                         let text: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
                         SetWindowTextW(state.tooltip, windows::core::PCWSTR(text.as_ptr())).ok();

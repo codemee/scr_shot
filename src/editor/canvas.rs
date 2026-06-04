@@ -14,6 +14,7 @@ enum UndoOp {
         height:  i32,
         strokes: Vec<(Stroke, Color, i32)>,
     },
+    Mosaic { base: ScreenBitmap }, // 只有 base 像素改變，寬高與 strokes 不變
 }
 
 pub struct Canvas {
@@ -90,7 +91,60 @@ impl Canvas {
                 self.height  = height;
                 self.strokes = strokes;
             }
+            Some(UndoOp::Mosaic { base }) => {
+                self.base = base; // 還原馬賽克前的像素
+            }
             None => {}
+        }
+    }
+
+    /// 對選取矩形套用馬賽克（像素化），block_size 為每個馬賽克方塊的像素大小
+    pub fn apply_mosaic(&mut self, r: windows::Win32::Foundation::RECT, block_size: i32) {
+        let x = r.left.clamp(0, self.width);
+        let y = r.top.clamp(0, self.height);
+        let w = (r.right.clamp(0, self.width) - x).max(0);
+        let h = (r.bottom.clamp(0, self.height) - y).max(0);
+        if w <= 0 || h <= 0 { return; }
+
+        // 儲存快照供復原
+        self.undo_ops.push(UndoOp::Mosaic { base: self.base.clone() });
+
+        let bs = block_size.max(2) as usize;
+        let iw = self.width as usize;
+
+        // 以方塊為單位計算平均色並填回
+        let mut block_y = 0usize;
+        while block_y < h as usize {
+            let mut block_x = 0usize;
+            let by_end = (block_y + bs).min(h as usize);
+            while block_x < w as usize {
+                let bx_end = (block_x + bs).min(w as usize);
+
+                // 計算方塊內平均 BGR
+                let (mut sb, mut sg, mut sr, mut n) = (0u64, 0u64, 0u64, 0u64);
+                for ry in block_y..by_end {
+                    for rx in block_x..bx_end {
+                        let off = ((y as usize + ry) * iw + (x as usize + rx)) * 4;
+                        sb += self.base.data[off]     as u64;
+                        sg += self.base.data[off + 1] as u64;
+                        sr += self.base.data[off + 2] as u64;
+                        n  += 1;
+                    }
+                }
+                if n > 0 {
+                    let (ab, ag, ar) = ((sb/n) as u8, (sg/n) as u8, (sr/n) as u8);
+                    for ry in block_y..by_end {
+                        for rx in block_x..bx_end {
+                            let off = ((y as usize + ry) * iw + (x as usize + rx)) * 4;
+                            self.base.data[off]     = ab;
+                            self.base.data[off + 1] = ag;
+                            self.base.data[off + 2] = ar;
+                        }
+                    }
+                }
+                block_x += bs;
+            }
+            block_y += bs;
         }
     }
 

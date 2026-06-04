@@ -173,6 +173,13 @@ SetCapture(drop);
 `Canvas::crop(r: RECT)` 直接修改 `self.base`，並對所有 `strokes` 呼叫 `Stroke::translate(-x, -y)` 調整座標。  
 裁切前先把完整快照推入 `undo_ops: Vec<UndoOp>`（`UndoOp::Crop { base, width, height, strokes }`），可以復原。
 
+### 馬賽克工具
+
+`Canvas::apply_mosaic(r: RECT, block_size: i32)` 對選取矩形套用像素化效果：
+- 以 `block_size`×`block_size`（預設 12px）為單位，計算每個方塊內所有像素的平均 BGR，再填回
+- 直接修改 `self.base` 像素資料，不新增 Stroke
+- 套用前推入 `UndoOp::Mosaic { base: ScreenBitmap }`（只需快照 base，寬高與 strokes 不變）
+
 Undo 系統採 `UndoOp` enum：
 - `UndoOp::Stroke` → `strokes.pop()`
 - `UndoOp::Crop { snapshot }` → 還原整個 canvas 狀態

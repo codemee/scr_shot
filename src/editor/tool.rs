@@ -11,6 +11,7 @@ pub enum Tool {
     Rect,
     Text,
     Crop,
+    Mosaic,
 }
 
 #[derive(Clone, Debug)]

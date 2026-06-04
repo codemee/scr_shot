@@ -1,10 +1,10 @@
 [package]
-name = "srcshot"
+name = "ezshot"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "srcshot"
+name = "ezshot"
 path = "src/main.rs"
 
 [dependencies]
@@ -29,4 +29,4 @@ lto = true
 opt-level = 3
 
 [package.metadata.winres]
-FileDescription = "srcshot"
+FileDescription = "ezshot"

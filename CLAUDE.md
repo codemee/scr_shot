@@ -245,4 +245,4 @@ SetWindowPos(hwnd, HWND_NOTOPMOST, ..., SWP_NOMOVE|SWP_NOSIZE);
 - `HWND` 不實作 `Send`，跨執行緒傳遞視窗 handle 須先轉成 `isize`
 - `PtInRect` 在 `*` glob 不可用，改用直接座標比較
 - `DefWindowProcW` 是泛型函式，不能直接作為 `WNDCLASSEXW.lpfnWndProc` 的函式指標；需包一層 `unsafe extern "system" fn wrapper(h, m, w, l) -> LRESULT { DefWindowProcW(h, m, w, l) }`
-- 重新執行前先確認舊程序已結束：`Stop-Process -Name srcshot -Force`（否則 binary 被鎖定，`cargo build` 會失敗）
+- 重新執行前先確認舊程序已結束：`Stop-Process -Name ezshot -Force`（否則 binary 被鎖定，`cargo build` 會失敗）

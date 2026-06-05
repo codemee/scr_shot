@@ -1,70 +1,71 @@
 # ezshot
 
-Windows 螢幕截圖工具，常駐系統匣，支援全域快捷鍵、截圖後即時標註與裁切。
+**Languages:** [繁體中文](README.zh-TW.md) | English
 
-## 功能
+A Windows screenshot tool that lives in the system tray, with global hotkeys, annotation, and cropping.
 
-### 截圖模式
+## Features
 
-| 快捷鍵 | 模式 |
+### Capture Modes
+
+| Hotkey | Mode |
 |--------|------|
-| `Alt+Shift+R` | 拖曳框選區域 |
-| `Alt+Shift+A` | 擷取目前作用中視窗 |
-| `Alt+Shift+W` | 點選任意視窗 |
+| `Alt+Shift+R` | Drag to select a region |
+| `Alt+Shift+A` | Capture the active window |
+| `Alt+Shift+W` | Click any window to capture it |
 
-### 延遲擷取
+### Delayed Capture
 
-系統匣右鍵選單可設定延遲（0 / 1 / 2 / 3 / 5 秒或自訂），方便擷取懸停選單、tooltip 等瞬間狀態。  
-倒數期間螢幕中央顯示計時數字，並以橘色框標示即將擷取的區域。
+Set a delay (0 / 1 / 2 / 3 / 5 s or custom) from the tray menu to capture hover menus, tooltips, and other transient states. A countdown and an orange highlight box are shown during the delay.
 
-### 編輯器
+### Editor
 
-截圖後開啟多分頁編輯器：
+Each capture opens in a new tab in the persistent editor window:
 
-| 工具 | 說明 |
-|------|------|
-| 筆 | 自由繪製 |
-| 箭頭 | 繪製箭頭 |
-| 矩形 | 繪製矩形框 |
-| 文字 | 點擊後輸入文字 |
-| 裁切 | 拖曳選取區域後立即裁切（可復原） |
-| 馬賽克 | 拖曳選取區域套用馬賽克遮蓋（可復原） |
-| 顏色 / 粗細 | 下拉面板選色（12 預設色 + 系統調色盤）；內含粗細輸入框與線條預覽 |
-| 複製 | 複製到剪貼簿 |
-| 儲存 | 首次開對話框（預設檔名為時間戳記）；之後直接覆蓋 |
-| 另存 | 另存至新位置（預設帶入現有檔名；需先存過一次） |
-| 復原 | 復原最後一筆畫或裁切 |
-| ≡ 設定 | 開啟設定選單（與系統匣設定同步） |
+| Tool | Description |
+|------|-------------|
+| Pen | Freehand drawing |
+| Arrow | Draw arrows |
+| Rectangle | Draw rectangles |
+| Text | Click to type text |
+| Crop | Drag to crop immediately (undoable) |
+| Mosaic | Drag to pixelate a region (undoable) |
+| Color / Thickness | Dropdown panel: 12 preset colors + system color picker; thickness input with line preview |
+| Copy | Copy to clipboard |
+| Save | First save opens a dialog (default filename is a timestamp); subsequent saves overwrite |
+| Save As | Save to a new location |
+| Undo | Undo the last stroke, crop, or mosaic |
+| ≡ Settings | Open settings (shared with tray menu) |
 
-- 每次截圖開一個新**分頁**，分頁名稱為截圖時間戳記（`YYYYMMDDhhmmss`）
-- 視窗標題顯示 `ezshot-<分頁名稱>`
-- 有未存修改的分頁顯示紅點警示；存檔後消失
-- 點分頁右側 × 關閉單一分頁；分頁全關時視窗隱藏（不銷毀）
-- `Esc` 或視窗 × 隱藏視窗，分頁完整保留；雙按系統匣圖示重新叫出
-- 分頁過多時自動捲動，新截圖永遠可見
+- Each capture opens a new **tab** named with its timestamp (`YYYYMMDDhhmmss`)
+- Window title shows `ezshot-<tab name>`
+- Tabs with unsaved changes show a red dot; it clears on save
+- Click × on a tab to close it; closing all tabs hides the window (does not destroy it)
+- `Esc` or the window × hides the window — tabs are preserved; double-click the tray icon to restore
+- Tabs scroll automatically when there are too many; the newest is always visible
 
-### 設定（系統匣右鍵 / 工具列 ≡ 按鈕）
+### Settings (tray right-click / toolbar ≡ button)
 
-- **擷取滑鼠游標**：截圖是否包含游標
-- **直接複製到剪貼簿**：擷取後自動複製至剪貼簿，再開啟編輯器
-- **擷取前隱藏編輯視窗**：按快捷鍵時先隱藏編輯視窗再截圖
-- **延遲擷取**：倒數秒數（支援自訂）
-- 設定自動儲存至 `%APPDATA%\ezshot\settings.ini`
-- 儲存路徑記憶至 `%APPDATA%\ezshot\last_dir.txt`
+- **Capture cursor**: include the mouse cursor in screenshots
+- **Auto-copy to clipboard**: copy to clipboard immediately after capture, before opening the editor
+- **Hide editor before capture**: hide the editor window while taking a screenshot
+- **Capture delay**: countdown in seconds (custom value supported)
+- Settings are saved to `%APPDATA%\ezshot\settings.ini`
+- Last save directory is remembered in `%APPDATA%\ezshot\last_dir.txt`
 
-## 系統需求
+## Requirements
 
-- Windows 10 / 11（x64）
-- Rust toolchain（用於從原始碼建置）
+- Windows 10 / 11 (x64)
+- Rust toolchain (only needed to build from source)
 
-## 建置
+## Build
 
 ```powershell
 cargo build --release
 ```
 
-產生的執行檔位於 `target\release\ezshot.exe`，無需安裝，直接執行即常駐系統匣。
+The output is `target\release\ezshot.exe`. No installation required — just run it and it appears in the system tray.
 
-## 技術
+## Tech
 
-純 Rust + Win32 API（`windows` crate 0.58），不依賴 .NET 或第三方 UI 框架。
+Pure Rust + Win32 API (`windows` crate 0.58). No .NET or third-party UI framework.

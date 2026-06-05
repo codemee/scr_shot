@@ -40,8 +40,9 @@ Each capture opens in a new tab in the persistent editor window:
 - Each capture opens a new **tab** named with its timestamp (`YYYYMMDDhhmmss`)
 - Window title shows `ezshot-<tab name>`
 - Tabs with unsaved changes show a red dot; it clears on save
-- Click × on a tab to close it; closing all tabs hides the window (does not destroy it)
-- `Esc` or the window × hides the window — tabs are preserved; double-click the tray icon to restore
+- Click × on a tab to close it — if unsaved, a flat confirmation dialog appears (Save / Don't Save / Cancel)
+- Clicking the window × button prompts for each unsaved tab before hiding the window
+- `Esc` hides the window without prompting — tabs are preserved; double-click the tray icon to restore
 - Tabs scroll automatically when there are too many; the newest is always visible
 
 ### Settings (tray right-click / toolbar ≡ button)
@@ -50,6 +51,7 @@ Each capture opens in a new tab in the persistent editor window:
 - **Auto-copy to clipboard**: copy to clipboard immediately after capture, before opening the editor
 - **Hide editor before capture**: hide the editor window while taking a screenshot
 - **Capture delay**: countdown in seconds (custom value supported)
+- **Close All Tabs**: prompts for each unsaved tab (Save / Don't Save / Discard All / Cancel); hides the window when done
 - Settings are saved to `%APPDATA%\ezshot\settings.ini`
 - Last save directory is remembered in `%APPDATA%\ezshot\last_dir.txt`
 

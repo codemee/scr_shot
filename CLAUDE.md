@@ -209,15 +209,37 @@ Undo 系統採 `UndoOp` enum：
 
 ### 多分頁編輯器
 
-每次截圖開一個新分頁，視窗以持久方式存在（`WM_CLOSE` 只隱藏）。
+每次截圖開一個新分頁，視窗以持久方式存在。
 
 - `WM_NEW_TAB = WM_APP+2`：app 傳 `Box<ScreenBitmap>` raw ptr，editor 建立新分頁
 - `WM_FORCE_QUIT = WM_APP+3`：TrayQuit 時送出，editor 真正銷毀
-- `WM_SHOW_EDITOR = WM_APP+4`：雙按系統匣圖示，帶視窗到前景
+- `WM_SHOW_EDITOR = WM_APP+4`：雙按系統匣圖示，帶視窗到前景（分頁為空時不顯示）
 - Editor HWND 存於 `Arc<Mutex<Option<isize>>>`，共享給 app.rs state machine
 - 標籤列：`CreateRoundRectRgn` + `IntersectClipRect` 裁切到標籤列範圍 → 上方圓角、平底
 - Tooltip 使用 `WS_EX_LAYERED | WS_EX_NOACTIVATE`，`SetWindowPos` 加 `SWP_NOACTIVATE`：
   不觸發下方 WM_PAINT，不搶奪焦點（避免編輯視窗陰影消失）
+
+### 分頁關閉確認流程
+
+未存分頁的判斷條件：`tab.modified || tab.saved_path.is_none()`（與紅點顯示邏輯一致）。
+
+| 觸發動作 | 行為 |
+|----------|------|
+| 點分頁 × | `close_tab_with_confirm`：3 按鈕扁平對話框（儲存 / 不儲存 / 取消） |
+| 視窗 × / ≡ 關閉所有頁籤 | `close_all_tabs`：逐分頁詢問，含「通通不存檔」選項；完成後隱藏視窗 |
+| ESC | 直接隱藏，不詢問 |
+
+`WM_PAINT` 的畫布渲染區段加了 `&& !state.tabs.is_empty()` 守衛，防止分頁清空後重繪時越界崩潰。
+
+### 扁平確認對話框（flat_dlg_paint / flat_dlg_drawbtn）
+
+`close_tab_with_confirm` 與 `confirm_save_tab_dialog` 共用兩個模組層級 helper：
+
+- `flat_dlg_paint(hdc, w, h, msg_ptr)`：填工具列背景色、1px 細邊框（LineTo 畫四邊）、DrawTextW 訊息文字
+- `flat_dlg_drawbtn(lp: LPARAM)`：`WM_DRAWITEM` 用，解 `DRAWITEMSTRUCT`，按鈕 ID=1 畫藍色（`#0078D4`），其餘畫圓角灰底
+
+對話框視窗樣式：`WS_POPUP | WS_VISIBLE`（無標題列）+ `CS_DROPSHADOW`（投影）+ `WS_EX_TOPMOST`。  
+按鈕樣式：`BS_OWNERDRAW | WS_TABSTOP`，位置計算在建立前 `GetWindowRect(parent)` 置中。
 
 ### 防閃爍（進階）
 

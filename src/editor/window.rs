@@ -53,7 +53,8 @@ const CM_LANG_EN:   u32 = 3302;
 const CM_THEME_AUTO:  u32 = 3310;
 const CM_THEME_LIGHT: u32 = 3311;
 const CM_THEME_DARK:  u32 = 3312;
-const CM_QUIT:     u32 = 3099;
+const CM_QUIT:       u32 = 3099;
+const CM_CLOSE_ALL:  u32 = 3021;
 
 const BTN_SETTINGS: usize = 25; // 設定按鈕（≡）
 
@@ -608,7 +609,7 @@ unsafe extern "system" fn editor_wnd_proc(
                     let tx0 = slot as i32 * TAB_W;
                     let tw  = TAB_W;
                     if cx >= tx0 + tw - 18 {
-                        close_tab(hwnd, state, idx);
+                        close_tab_with_confirm(hwnd, state, idx);
                     } else {
                         state.active_tab = idx;
                         state.dragging = false;
@@ -859,7 +860,7 @@ unsafe extern "system" fn editor_wnd_proc(
             } // end if ps.rcPaint.top < CANVAS_Y
 
             // 只有更新區域涵蓋畫布時才做昂貴的 Canvas::render
-            if ps.rcPaint.bottom > CANVAS_Y {
+            if ps.rcPaint.bottom > CANVAS_Y && !state.tabs.is_empty() {
                 let screen_dc = GetDC(HWND(std::ptr::null_mut()));
 
                 let buf_dc  = CreateCompatibleDC(screen_dc);
@@ -1152,9 +1153,10 @@ unsafe extern "system" fn editor_wnd_proc(
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
-        // WM_CLOSE：隱藏視窗（不銷毀），保留所有分頁
+        // WM_CLOSE：逐一詢問未存分頁，全部確認後隱藏視窗
         WM_CLOSE => {
-            ShowWindow(hwnd, SW_HIDE);
+            let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+            close_all_tabs(hwnd, state);
             LRESULT(0)
         }
         // 主題已由系統匣變更 → 全視窗重繪
@@ -1162,11 +1164,14 @@ unsafe extern "system" fn editor_wnd_proc(
             InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
-        // 雙按系統匣 → 帶到前景
+        // 雙按系統匣 → 帶到前景（無分頁時不顯示）
         WM_SHOW_EDITOR => {
-            SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW).ok();
-            SetForegroundWindow(hwnd).ok();
-            SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE).ok();
+            let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+            if !state.tabs.is_empty() {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW).ok();
+                SetForegroundWindow(hwnd).ok();
+                SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE).ok();
+            }
             LRESULT(0)
         }
         // 新截圖分頁（lParam = *mut ScreenBitmap）
@@ -1236,6 +1241,152 @@ unsafe fn update_window_title(hwnd: HWND, state: &EditorState) {
     SetWindowTextW(hwnd, windows::core::PCWSTR(title.as_ptr())).ok();
 }
 
+/// 扁平對話框共用：繪製背景、邊框、訊息文字
+unsafe fn flat_dlg_paint(hdc: windows::Win32::Graphics::Gdi::HDC, w: i32, h: i32, msg_ptr: *const u16) {
+    let tc = crate::theme::colors();
+    let bg = CreateSolidBrush(COLORREF(tc.toolbar_bg));
+    FillRect(hdc, &RECT { left: 0, top: 0, right: w, bottom: h }, bg);
+    DeleteObject(bg);
+    let border_c = if crate::theme::current() == crate::theme::Theme::Dark { 0x00_55_55_55u32 } else { 0x00_C0_C0_C0u32 };
+    let pen = CreatePen(PS_SOLID, 1, COLORREF(border_c));
+    let old_p = SelectObject(hdc, pen);
+    MoveToEx(hdc, 0, 0, None); LineTo(hdc, w - 1, 0);
+    LineTo(hdc, w - 1, h - 1); LineTo(hdc, 0, h - 1); LineTo(hdc, 0, 0);
+    SelectObject(hdc, old_p); DeleteObject(pen);
+    let mut len = 0usize;
+    while *msg_ptr.add(len) != 0 { len += 1; }
+    let mut msg: Vec<u16> = std::slice::from_raw_parts(msg_ptr, len).to_vec();
+    SetBkMode(hdc, BACKGROUND_MODE(1));
+    SetTextColor(hdc, COLORREF(tc.tab_text_active));
+    let of = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    let mut tr = RECT { left: 16, top: 14, right: w - 16, bottom: 44 };
+    DrawTextW(hdc, &mut msg, &mut tr, DRAW_TEXT_FORMAT(0x8000));
+    SelectObject(hdc, of);
+}
+
+/// 扁平對話框共用：繪製按鈕（WM_DRAWITEM 用）
+unsafe fn flat_dlg_drawbtn(lp: LPARAM) {
+    let dis = &*(lp.0 as *const DRAWITEMSTRUCT);
+    let pressed = dis.itemState.0 & 0x0001 != 0;
+    let is_default = dis.CtlID == 1;
+    let dark = crate::theme::current() == crate::theme::Theme::Dark;
+    let tc = crate::theme::colors();
+    let (bg_c, text_c, border_c): (u32, u32, u32) = if is_default {
+        let bg = if pressed { 0x00_AA_5E_00 } else { 0x00_D4_78_00 }; // Windows blue #0078D4 (BGR)
+        (bg, 0x00_FF_FF_FF, bg)
+    } else {
+        let bg = if pressed {
+            if dark { 0x00_50_50_50 } else { 0x00_C8_C8_C8 }
+        } else {
+            if dark { 0x00_3C_3C_3C } else { 0x00_E8_E8_E8 }
+        };
+        (bg, tc.tab_text_active, if dark { 0x00_65_65_65u32 } else { 0x00_B0_B0_B0u32 })
+    };
+    let hdc = dis.hDC;
+    let r = dis.rcItem;
+    let pen = CreatePen(PS_SOLID, 1, COLORREF(border_c));
+    let brush = CreateSolidBrush(COLORREF(bg_c));
+    let op = SelectObject(hdc, pen); let ob = SelectObject(hdc, brush);
+    RoundRect(hdc, r.left, r.top, r.right, r.bottom, 5, 5);
+    SelectObject(hdc, op); SelectObject(hdc, ob);
+    DeleteObject(pen); DeleteObject(brush);
+    SetBkMode(hdc, BACKGROUND_MODE(1));
+    SetTextColor(hdc, COLORREF(text_c));
+    let of = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    let n = GetWindowTextLengthW(dis.hwndItem) as usize;
+    let mut buf = vec![0u16; n + 1];
+    GetWindowTextW(dis.hwndItem, &mut buf);
+    buf.truncate(n);
+    let mut rc = r;
+    DrawTextW(hdc, &mut buf, &mut rc, DRAW_TEXT_FORMAT(0x25));
+    SelectObject(hdc, of);
+}
+
+/// 關閉分頁前詢問是否儲存（3 個按鈕：儲存、不儲存、取消）
+unsafe fn close_tab_with_confirm(hwnd: HWND, state: &mut EditorState, idx: usize) {
+    if idx >= state.tabs.len() { return; }
+    if state.tabs[idx].modified || state.tabs[idx].saved_path.is_none() {
+        let class = w!("srcshot_closetab");
+        let hinstance = get_instance();
+        let tab_name = state.tabs[idx].name.clone();
+        let msg_w: Vec<u16> = if crate::i18n::current() == crate::i18n::Lang::Zh {
+            format!("「{}」有未儲存的修改，要在關閉前儲存嗎？\0", tab_name)
+        } else {
+            format!("\"{}\" has unsaved changes. Save before closing?\0", tab_name)
+        }.encode_utf16().collect();
+
+        struct DS { result: u32, done: bool, msg_ptr: *const u16 }
+        unsafe extern "system" fn dp(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            match msg {
+                WM_NCCREATE => { let cs = &*(lp.0 as *const CREATESTRUCTW); SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as _); LRESULT(1) }
+                WM_CREATE => {
+                    let hi = get_instance();
+                    let sty = WS_CHILD|WS_VISIBLE|WS_TABSTOP|WINDOW_STYLE(0x0000000Bu32); // BS_OWNERDRAW
+                    let lbls = [("儲存","Save"),("不儲存","Don't Save"),("取消","Cancel")];
+                    let xpos = [16i32, 100, 198]; let wids = [76i32, 90, 72];
+                    for (i, ((zh,en), (&x, &bw))) in lbls.iter().zip(xpos.iter().zip(wids.iter())).enumerate() {
+                        let l: Vec<u16> = crate::i18n::t(zh,en).encode_utf16().chain(Some(0u16)).collect();
+                        CreateWindowExW(Default::default(), w!("BUTTON"), windows::core::PCWSTR(l.as_ptr()),
+                            sty, x, 54, bw, 32, hwnd, HMENU((i+1) as usize as _), hi, None).ok();
+                    }
+                    LRESULT(0)
+                }
+                WM_ERASEBKGND => LRESULT(1),
+                WM_PAINT => {
+                    let st = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const DS);
+                    let mut ps = PAINTSTRUCT::default();
+                    let hdc = BeginPaint(hwnd, &mut ps);
+                    let mut rc = RECT::default();
+                    GetClientRect(hwnd, &mut rc).ok();
+                    flat_dlg_paint(hdc, rc.right, rc.bottom, st.msg_ptr);
+                    EndPaint(hwnd, &ps);
+                    LRESULT(0)
+                }
+                WM_DRAWITEM => { flat_dlg_drawbtn(lp); LRESULT(1) }
+                WM_COMMAND => {
+                    let id = (wp.0 & 0xFFFF) as u32;
+                    if matches!(id, 1..=3) { let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS); s.result = id; s.done = true; let _ = DestroyWindow(hwnd); }
+                    LRESULT(0)
+                }
+                WM_CLOSE => { let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS); s.result = 3; s.done = true; let _ = DestroyWindow(hwnd); LRESULT(0) }
+                WM_DESTROY => LRESULT(0),
+                _ => DefWindowProcW(hwnd, msg, wp, lp),
+            }
+        }
+        let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, style: CS_DROPSHADOW, lpfnWndProc: Some(dp), hInstance: hinstance, lpszClassName: class, ..Default::default() };
+        let _ = RegisterClassExW(&wc);
+        let dlg_w = 360i32; let dlg_h = 104i32;
+        let (px, py) = { let mut pr = RECT::default(); GetWindowRect(hwnd, &mut pr).ok(); ((pr.left+pr.right)/2 - dlg_w/2, (pr.top+pr.bottom)/2 - dlg_h/2) };
+        let mut ds = DS { result: 3, done: false, msg_ptr: msg_w.as_ptr() };
+        let dlg = CreateWindowExW(WS_EX_TOPMOST, class, w!(""), WS_POPUP|WS_VISIBLE,
+            px, py, dlg_w, dlg_h, hwnd, HMENU(std::ptr::null_mut()), hinstance,
+            Some(&mut ds as *mut _ as _)).unwrap_or(HWND(std::ptr::null_mut()));
+        if !dlg.0.is_null() {
+            SetForegroundWindow(dlg).ok();
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
+                if msg.message == WM_KEYDOWN {
+                    match msg.wParam.0 {
+                        k if k == VK_RETURN.0 as usize => { ds.result = 1; ds.done = true; let _ = DestroyWindow(dlg); break; }
+                        k if k == VK_ESCAPE.0 as usize => { ds.result = 3; ds.done = true; let _ = DestroyWindow(dlg); break; }
+                        _ => {}
+                    }
+                }
+                if IsDialogMessageW(dlg, &msg).as_bool() { if ds.done { break; } continue; }
+                let _ = TranslateMessage(&msg); DispatchMessageW(&msg);
+                if ds.done { break; }
+            }
+        }
+        let _ = UnregisterClassW(class, hinstance);
+        match ds.result {
+            1 => { if !save_tab_file(hwnd, state, idx) { return; } }
+            2 => {}
+            _ => { return; }
+        }
+    }
+    close_tab(hwnd, state, idx);
+}
+
 /// 關閉第 idx 個分頁；無分頁時隱藏視窗
 unsafe fn close_tab(hwnd: HWND, state: &mut EditorState, idx: usize) {
     if idx >= state.tabs.len() { return; }
@@ -1251,6 +1402,154 @@ unsafe fn close_tab(hwnd: HWND, state: &mut EditorState, idx: usize) {
     update_scrollbars(hwnd, state);
     update_window_title(hwnd, state);
     InvalidateRect(hwnd, None, false);
+}
+
+/// 儲存指定索引的分頁（會開啟存檔對話框），回傳 true 表示完成，false 表示取消
+unsafe fn save_tab_file(hwnd: HWND, state: &mut EditorState, idx: usize) -> bool {
+    let flat = state.tabs[idx].canvas.flatten_to_bitmap();
+    let existing = state.tabs[idx].saved_path.clone();
+    let chosen = if let Some(ref p) = existing {
+        Some(p.clone())
+    } else {
+        let tab_name = state.tabs[idx].name.clone();
+        show_save_dialog(hwnd, &state.tabs[idx].save_dir, &tab_name)
+    };
+    if let Some(path) = chosen {
+        let _ = crate::output::file::save_png(&flat, &path);
+        if let Some(parent_dir) = path.parent() {
+            let dir = parent_dir.to_path_buf();
+            state.tabs[idx].save_dir = dir.clone();
+            state.default_save_dir = dir.clone();
+            crate::config::persist_save_dir(&dir);
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            state.tabs[idx].name = stem.to_string();
+        }
+        state.tabs[idx].saved_path = Some(path);
+        state.tabs[idx].modified = false;
+        true
+    } else {
+        false
+    }
+}
+
+/// 關閉所有分頁時對每個未存分頁的確認選項
+#[derive(Clone, Copy, PartialEq)]
+enum ConfirmSaveResult { Save, Skip, DiscardAll, Cancel }
+
+/// 詢問是否儲存指定分頁（關閉所有分頁流程用）
+/// 傳回：Save 儲存、Skip 不儲存、DiscardAll 通通不存檔、Cancel 中止
+unsafe fn confirm_save_tab_dialog(parent: HWND, tab_name: &str) -> ConfirmSaveResult {
+    let class = w!("srcshot_confirmsave");
+    let hinstance = get_instance();
+    let msg_w: Vec<u16> = if crate::i18n::current() == crate::i18n::Lang::Zh {
+        format!("「{}」有未儲存的修改，要在關閉前儲存嗎？\0", tab_name)
+    } else {
+        format!("\"{}\" has unsaved changes. Save before closing?\0", tab_name)
+    }.encode_utf16().collect();
+
+    struct DS { result: u32, done: bool, msg_ptr: *const u16 }
+
+    unsafe extern "system" fn dp(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        match msg {
+            WM_NCCREATE => { let cs = &*(lp.0 as *const CREATESTRUCTW); SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as _); LRESULT(1) }
+            WM_CREATE => {
+                let hi = get_instance();
+                let sty = WS_CHILD|WS_VISIBLE|WS_TABSTOP|WINDOW_STYLE(0x0000000Bu32); // BS_OWNERDRAW
+                let lbls = [("儲存","Save"),("不儲存","Don't Save"),("通通不存檔","Discard All"),("取消","Cancel")];
+                let xpos = [16i32, 100, 198, 322]; let wids = [76i32, 90, 116, 72];
+                for (i, ((zh,en), (&x, &bw))) in lbls.iter().zip(xpos.iter().zip(wids.iter())).enumerate() {
+                    let l: Vec<u16> = crate::i18n::t(zh,en).encode_utf16().chain(Some(0u16)).collect();
+                    CreateWindowExW(Default::default(), w!("BUTTON"), windows::core::PCWSTR(l.as_ptr()),
+                        sty, x, 54, bw, 32, hwnd, HMENU((i+1) as usize as _), hi, None).ok();
+                }
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                let st = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const DS);
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                let mut rc = RECT::default();
+                GetClientRect(hwnd, &mut rc).ok();
+                flat_dlg_paint(hdc, rc.right, rc.bottom, st.msg_ptr);
+                EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_DRAWITEM => { flat_dlg_drawbtn(lp); LRESULT(1) }
+            WM_COMMAND => {
+                let id = (wp.0 & 0xFFFF) as u32;
+                if matches!(id, 1..=4) { let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS); s.result = id; s.done = true; let _ = DestroyWindow(hwnd); }
+                LRESULT(0)
+            }
+            WM_CLOSE => { let s = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DS); s.result = 4; s.done = true; let _ = DestroyWindow(hwnd); LRESULT(0) }
+            WM_DESTROY => LRESULT(0),
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+
+    let wc = WNDCLASSEXW { cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32, style: CS_DROPSHADOW, lpfnWndProc: Some(dp), hInstance: hinstance, lpszClassName: class, ..Default::default() };
+    let _ = RegisterClassExW(&wc);
+    let dlg_w = 460i32; let dlg_h = 104i32;
+    let (px, py) = { let mut pr = RECT::default(); GetWindowRect(parent, &mut pr).ok(); ((pr.left+pr.right)/2 - dlg_w/2, (pr.top+pr.bottom)/2 - dlg_h/2) };
+    let mut ds = DS { result: 4, done: false, msg_ptr: msg_w.as_ptr() };
+    let dlg = CreateWindowExW(WS_EX_TOPMOST, class, w!(""), WS_POPUP|WS_VISIBLE,
+        px, py, dlg_w, dlg_h,
+        parent, HMENU(std::ptr::null_mut()), hinstance,
+        Some(&mut ds as *mut _ as _),
+    ).unwrap_or(HWND(std::ptr::null_mut()));
+    if dlg.0.is_null() {
+        let _ = UnregisterClassW(class, hinstance);
+        return ConfirmSaveResult::Cancel;
+    }
+    SetForegroundWindow(dlg).ok();
+    let mut msg = MSG::default();
+    while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
+        if msg.message == WM_KEYDOWN {
+            match msg.wParam.0 {
+                k if k == VK_RETURN.0 as usize => { ds.result = 1; ds.done = true; let _ = DestroyWindow(dlg); break; }
+                k if k == VK_ESCAPE.0 as usize => { ds.result = 4; ds.done = true; let _ = DestroyWindow(dlg); break; }
+                _ => {}
+            }
+        }
+        if IsDialogMessageW(dlg, &msg).as_bool() { if ds.done { break; } continue; }
+        let _ = TranslateMessage(&msg); DispatchMessageW(&msg);
+        if ds.done { break; }
+    }
+    let _ = UnregisterClassW(class, hinstance);
+    match ds.result {
+        1 => ConfirmSaveResult::Save,
+        2 => ConfirmSaveResult::Skip,
+        3 => ConfirmSaveResult::DiscardAll,
+        _ => ConfirmSaveResult::Cancel,
+    }
+}
+
+/// 關閉所有分頁：對有未存修改的分頁逐一詢問，通通不存檔或取消可提前結束
+unsafe fn close_all_tabs(hwnd: HWND, state: &mut EditorState) {
+    let mut discard_all = false;
+    let mut i = 0;
+    while i < state.tabs.len() {
+        if (state.tabs[i].modified || state.tabs[i].saved_path.is_none()) && !discard_all {
+            let tab_name = state.tabs[i].name.clone();
+            match confirm_save_tab_dialog(hwnd, &tab_name) {
+                ConfirmSaveResult::Save => {
+                    if !save_tab_file(hwnd, state, i) {
+                        // 使用者在存檔對話框取消 → 中止整個關閉流程
+                        return;
+                    }
+                }
+                ConfirmSaveResult::Skip => {}
+                ConfirmSaveResult::DiscardAll => { discard_all = true; }
+                ConfirmSaveResult::Cancel => { return; }
+            }
+        }
+        i += 1;
+    }
+    state.tabs.clear();
+    state.active_tab = 0;
+    state.tab_scroll = 0;
+    ShowWindow(hwnd, SW_HIDE);
 }
 
 fn client_xy(lp: LPARAM) -> (i32, i32) {
@@ -1906,6 +2205,11 @@ unsafe fn show_settings_popup(hwnd: HWND, state: &EditorState, sx: i32, sy: i32)
     let _ = AppendMenuW(hmenu, MF_POPUP, theme_menu.0 as usize, windows::core::PCWSTR(s_theme_title.as_ptr()));
     let theme_pos = GetMenuItemCount(hmenu) - 1;
 
+    // ── 關閉所有頁籤 ──
+    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
+    let s_close_all = tw("關閉所有頁籤", "Close All Tabs");
+    let _ = AppendMenuW(hmenu, MF_STRING, CM_CLOSE_ALL as usize, windows::core::PCWSTR(s_close_all.as_ptr()));
+
     // ── 套用圖示 ──
     use crate::menu_icon as mi;
     // 切換型 + 一般圖示：editor 選單跟隨 app 主題
@@ -2118,6 +2422,7 @@ unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) 
                 crate::config::persist_settings(&c);
             }
         }
+        CM_CLOSE_ALL => { close_all_tabs(hwnd, state); }
         CM_QUIT => { let _ = state.tx.send(crate::event::AppEvent::TrayQuit); }
         _ => {}
     }

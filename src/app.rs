@@ -21,7 +21,7 @@ pub fn run(config: Config) -> anyhow::Result<()> {
     let config      = Arc::new(Mutex::new(config));
     let editor_hwnd = Arc::new(Mutex::new(Option::<isize>::None));
 
-    let msg_hwnd = tray::create_message_window(tx.clone(), config.clone());
+    let msg_hwnd = tray::create_message_window(tx.clone(), config.clone(), editor_hwnd.clone());
     hotkey::register_all(msg_hwnd)?;
     let _tray = tray::make_tray(msg_hwnd);
 

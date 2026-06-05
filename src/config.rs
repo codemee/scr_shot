@@ -5,18 +5,22 @@ pub struct Config {
     pub capture_cursor: bool,
     pub capture_delay_secs: u32,
     pub auto_copy: bool,
-    pub hide_editor_on_capture: bool, // 按快捷鍵擷取前先隱藏編輯視窗
+    pub hide_editor_on_capture: bool,
+    pub language: String,
+    pub theme: String,                // "auto" | "light" | "dark"
 }
 
 impl Default for Config {
     fn default() -> Self {
-        let (cursor, delay, auto_copy, hide_on_capture) = load_settings();
+        let (cursor, delay, auto_copy, hide_on_capture, language, theme) = load_settings();
         Self {
             save_dir: load_save_dir(),
             capture_cursor: cursor,
             capture_delay_secs: delay,
             auto_copy,
             hide_editor_on_capture: hide_on_capture,
+            language,
+            theme,
         }
     }
 }
@@ -41,14 +45,16 @@ pub fn persist_save_dir(dir: &Path) {
 
 // ── 擷取設定（由系統匣執行緒讀寫）──────────────────────────────────────
 
-fn load_settings() -> (bool, u32, bool, bool) {
+fn load_settings() -> (bool, u32, bool, bool, String, String) {
     let mut cursor          = false;
     let mut delay           = 0u32;
     let mut auto_copy       = false;
     let mut hide_on_capture = false;
+    let mut language        = "auto".to_string();
+    let mut theme           = "auto".to_string();
     let path = match config_dir().map(|p| p.join("settings.ini")) {
         Some(p) => p,
-        None => return (cursor, delay, auto_copy, hide_on_capture),
+        None => return (cursor, delay, auto_copy, hide_on_capture, language, theme),
     };
     if let Ok(content) = std::fs::read_to_string(&path) {
         for line in content.lines() {
@@ -60,21 +66,27 @@ fn load_settings() -> (bool, u32, bool, bool) {
                 auto_copy = v == "1";
             } else if let Some(v) = line.strip_prefix("hide_editor_on_capture=") {
                 hide_on_capture = v == "1";
+            } else if let Some(v) = line.strip_prefix("language=") {
+                language = v.to_string();
+            } else if let Some(v) = line.strip_prefix("theme=") {
+                theme = v.to_string();
             }
         }
     }
-    (cursor, delay, auto_copy, hide_on_capture)
+    (cursor, delay, auto_copy, hide_on_capture, language, theme)
 }
 
 pub fn persist_settings(config: &Config) {
     if let Some(base) = config_dir() {
         let _ = std::fs::create_dir_all(&base);
         let content = format!(
-            "capture_cursor={}\ncapture_delay_secs={}\nauto_copy={}\nhide_editor_on_capture={}\n",
+            "capture_cursor={}\ncapture_delay_secs={}\nauto_copy={}\nhide_editor_on_capture={}\nlanguage={}\ntheme={}\n",
             if config.capture_cursor { 1 } else { 0 },
             config.capture_delay_secs,
             if config.auto_copy { 1 } else { 0 },
             if config.hide_editor_on_capture { 1 } else { 0 },
+            config.language,
+            config.theme,
         );
         let _ = std::fs::write(base.join("settings.ini"), content.as_bytes());
     }

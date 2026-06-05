@@ -70,6 +70,21 @@ Editing
 | `output/clipboard.rs` | Win32 clipboard CF_DIB 寫入（不用 arboard，HBITMAP 支援不完整） |
 | `output/file.rs` | BGRA → RGBA 轉換後用 image crate 存 PNG |
 | `config.rs` | 儲存路徑、游標擷取開關、延遲秒數；設定寫入 `%APPDATA%\ezshot\` |
+| `theme.rs` | `system_is_dark()`、`set_window_dark_menu(hwnd, dark)`、`restore_after_menu()`；透過 uxtheme.dll 序數 API 控制選單暗色 |
+| `menu_icon.rs` | `ICON_DARK: AtomicBool` + `set_icon_dark(bool)`；依暗/亮模式以 GDI 繪製選單圖示 |
+| `i18n.rs` | `tw(zh, en) -> Vec<u16>`；依系統語言回傳 UTF-16 字串 |
+
+### 暗色模式（theme.rs / menu_icon.rs）
+
+`SetPreferredAppMode`（uxtheme.dll 序數 135）是**程序全域**設定，無法單獨設定某個視窗。做法：
+
+- 顯示選單前：臨時設 `ForceDark(2)` 或 `ForceLight(3)` + `AllowDarkModeForWindow(hwnd, dark)`
+- 選單結束後：`restore_after_menu()` → 恢復 `AllowDark(1)` + `FlushMenuThemes()`（序數 136）
+- 系統匣選單跟**系統**主題；編輯器選單跟**應用程式**主題
+
+`ICON_DARK: AtomicBool`（menu_icon.rs）：呼叫方在 `TrackPopupMenu` 前先 `set_icon_dark(dark)`，圖示才用正確深/淺色。系統匣用 `system_is_dark()`，編輯器用 app 設定。
+
+主題變更通知：tray 透過 `PostMessageW(editor_hwnd, WM_THEME_CHANGED, ...)` 跨執行緒通知編輯器重繪。`WM_THEME_CHANGED = WM_APP + 5 = 0x8005`。
 
 ### 截圖流程（含延遲）
 
@@ -145,22 +160,24 @@ SetWindowPos(hwnd, None, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECH
 - 作用中工具 / 按下 / 動作按鈕保留各自顏色
 - **WM_MOUSEMOVE 的 `InvalidateRect` 只刷畫布區域**（`top=TOOLBAR_H`），避免繪圖時工具列閃爍
 
-### 下拉式顏色選取面板
+### 下拉式顏色＋粗細選取面板（simple_color_dialog）
 
-非模態下拉：`WS_POPUP | WS_BORDER`（無 `WS_CAPTION`），定位在 BTN_COLOR 正下方：
+非模態下拉：`WS_EX_TOPMOST | WS_POPUP | WS_BORDER`，定位在 BTN_COLOR 正下方。
+
+**外部點擊關閉**：使用 `WM_TIMER`（50ms）+ `GetAsyncKeyState(VK_LBUTTON)` + `GetCursorPos`，而非 `SetCapture`。`SetCapture` 曾導致焦點管理混亂、鍵盤輸入失效。`initial_btn_released` 旗標等待開啟時的滑鼠鍵放開，避免誤判。
+
+**粗細輸入**：真正的 Win32 EDIT 子控制項（`ES_NUMBER | ES_AUTOHSCROLL`），在 `WM_CREATE` 時建立。`EN_CHANGE` 通知父視窗更新橫線預覽（preview_thick）。面板的 `WM_PAINT` 只繪製色塊、分隔線和線條預覽，EDIT 自行重繪。
+
+**Enter / Escape**：在外層 `GetMessageW` 迴圈中攔截 `WM_KEYDOWN`，直接操作 stack 上的 `state`，不透過 GWLP_USERDATA。
 
 ```rust
-// 取得按鈕螢幕位置
-let btn = GetDlgItem(owner, BTN_COLOR as i32)?;
-GetWindowRect(btn, &mut btn_rc);
-// 在按鈕正下方建立面板
-CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, ..., WS_POPUP | WS_BORDER | WS_VISIBLE,
-    btn_rc.left, btn_rc.bottom, win_w, win_h, ...)
-// SetCapture 收所有滑鼠事件；WM_LBUTTONDOWN 在視窗外 → 取消關閉
-SetCapture(drop);
+// 建立 EDIT（WM_CREATE）
+CreateWindowExW(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_AUTOHSCROLL,
+    PAD, thick_y+2, EW, TH-4, hwnd, HMENU(100), hinstance, None)
+// WM_TIMER 外部點擊
+if btn_down && !inside { st.done = true; DestroyWindow(hwnd); }
+// 迴圈離開條件：WM_KEYDOWN RETURN/ESC → break；或 !IsWindow(drop) → break
 ```
-
-**關鍵**：下拉面板 WM_LBUTTONDOWN 用 client coordinates 判斷是否在範圍內（cx<0、cy<0、cx≥win_w、cy≥win_h → 視窗外）。
 
 ### 儲存對話框（IFileSaveDialog）
 

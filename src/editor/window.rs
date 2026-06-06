@@ -5,7 +5,7 @@ use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
     CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
-    DrawTextW, EndPaint, FillRect, FillRgn, FrameRgn, GetDC, GetStockObject,
+    DrawTextW, EndPaint, FillRect, FillRgn, GetDC, GetStockObject,
     IntersectClipRect, InvalidateRect,
     Arc as GdiArc, Ellipse, LineTo, MoveToEx, NULL_BRUSH, Polygon, Polyline,
     Rectangle as GdiRectangle, ReleaseDC, RestoreDC, RoundRect, SaveDC,
@@ -32,7 +32,6 @@ const TAB_H:    i32 = 28;              // 分頁列高度
 const CANVAS_Y: i32 = TAB_H + TOOLBAR_H; // 畫布起始 y（= 76）
 const TAB_W:    i32 = 148;             // 每個分頁的寬度（日期時間戳記 Consolas 需要更多空間）
 const TOOLBAR_H: i32 = 48;
-const TOOLBAR_BG: u32 = 0x00_F0_F0_F0; // 工具列背景色（沉浸式風格）
 const BTN_W: i32 = 40;
 const BTN_H: i32 = 36;
 const BTN_MARGIN: i32 = 4;
@@ -64,7 +63,6 @@ const BTN_RECT: usize  = 12;
 const BTN_TEXT: usize  = 13;
 const BTN_CROP:   usize = 14;
 const BTN_COLOR:  usize = 15;
-const THICKNESSES: [i32; 5] = [1, 2, 3, 5, 8];
 const BTN_MOSAIC: usize = 17;
 const BTN_COPY:    usize = 20;
 const BTN_SAVE:    usize = 21;
@@ -459,7 +457,7 @@ unsafe extern "system" fn editor_wnd_proc(
                     // 複製後保留分頁（不關閉）
                     let flat = state.tabs[state.active_tab].canvas.flatten_to_bitmap();
                     let _ = crate::output::clipboard::copy_to_clipboard(&flat);
-                    let _ = state.tx.send(AppEvent::EditorSave { to_clipboard: true, path: None });
+                    let _ = state.tx.send(AppEvent::EditorSave);
                     SetFocus(hwnd);
                 }
                 BTN_SAVE => {
@@ -490,7 +488,7 @@ unsafe extern "system" fn editor_wnd_proc(
                         state.tabs[state.active_tab].saved_path = Some(path.clone());
                         state.tabs[state.active_tab].modified = false;
                         update_window_title(hwnd, state);
-                        let _ = state.tx.send(AppEvent::EditorSave { to_clipboard: false, path: Some(path) });
+                        let _ = state.tx.send(AppEvent::EditorSave);
                         state.tabs[state.active_tab].result_sent = true;
                         // 不關閉分頁，讓使用者繼續編輯
                         update_scrollbars(hwnd, state);
@@ -523,7 +521,7 @@ unsafe extern "system" fn editor_wnd_proc(
                         state.tabs[state.active_tab].saved_path = Some(path.clone());
                         state.tabs[state.active_tab].modified = false;
                         update_window_title(hwnd, state);
-                        let _ = state.tx.send(AppEvent::EditorSave { to_clipboard: false, path: Some(path) });
+                        let _ = state.tx.send(AppEvent::EditorSave);
                         state.tabs[state.active_tab].result_sent = true;
                         update_scrollbars(hwnd, state);
                         InvalidateRect(hwnd, None, false);
@@ -1020,23 +1018,24 @@ unsafe extern "system" fn editor_wnd_proc(
                 BTN_COLOR => {
                     let tool_color = state.tabs[state.active_tab].canvas.tool_color;
                     let tool_thick = state.tabs[state.active_tab].canvas.tool_thickness;
-                    // 下方橫線（顏色＋粗細示意，最多顯示 6px）
-                    let bar_cy = rc.bottom - 7;
-                    let lpen = CreatePen(PS_SOLID, tool_thick.min(6).max(1), COLORREF(tool_color));
-                    let op = SelectObject(hdc, lpen);
-                    let _ = MoveToEx(hdc, rc.left + 6, bar_cy, None);
-                    let _ = LineTo(hdc, rc.right - 6, bar_cy);
-                    SelectObject(hdc, op); DeleteObject(lpen);
-                    // ▼ 小箭頭置中於上方
-                    let arrow_cy = (rc.top + rc.bottom) / 2 - 5;
+                    // ▼ 小箭頭在左側，垂直置中
+                    let ax = rc.left + 7;
                     let ap = CreatePen(PS_SOLID, 1, COLORREF(0x00_40_40_40));
                     let ab = CreateSolidBrush(COLORREF(0x00_40_40_40));
                     let top = SelectObject(hdc, ap); let tob = SelectObject(hdc, ab);
                     let _ = Polygon(hdc, &[
-                        POINT{x:cx-4,y:arrow_cy}, POINT{x:cx+4,y:arrow_cy}, POINT{x:cx,y:arrow_cy+4},
+                        POINT{x:ax-4,y:cy-2}, POINT{x:ax+4,y:cy-2}, POINT{x:ax,y:cy+2},
                     ]);
                     SelectObject(hdc, top); SelectObject(hdc, tob);
                     DeleteObject(ap); DeleteObject(ab);
+                    // 橫線在右側，平頭端點（FillRect 無圓弧溢出），垂直置中
+                    let t = tool_thick.min(14).max(1);
+                    let line_top = cy - t / 2;
+                    let line_rc = RECT { left: rc.left + 17, top: line_top,
+                        right: rc.right - 4, bottom: line_top + t };
+                    let lb = CreateSolidBrush(COLORREF(tool_color));
+                    FillRect(hdc, &line_rc, lb);
+                    DeleteObject(lb);
                 }
                 BTN_MOSAIC => {
                     // 3×3 像素方格（馬賽克圖示）
@@ -1146,26 +1145,35 @@ unsafe extern "system" fn editor_wnd_proc(
             } else if btn_hover >= 0 {
                 state.hover_ticks += 1;
                 if state.hover_ticks == 5 { // 5×100ms = 500ms 後顯示
-                    let labels = [
-                        crate::i18n::t("筆","Pen"),
-                        crate::i18n::t("箭頭","Arrow"),
-                        crate::i18n::t("矩形","Rect"),
-                        crate::i18n::t("文字","Text"),
-                        crate::i18n::t("裁切","Crop"),
-                        crate::i18n::t("馬賽克","Mosaic"),
-                        crate::i18n::t("顏色","Color"),
-                        crate::i18n::t("複製","Copy"),
-                        crate::i18n::t("儲存","Save"),
-                        crate::i18n::t("另存","Save As"),
-                        crate::i18n::t("復原","Undo"),
-                        crate::i18n::t("設定","Settings"),
+                    let labels: &[(&str, &str)] = &[
+                        (crate::i18n::t("筆","Pen"),          "Alt+P"),
+                        (crate::i18n::t("箭頭","Arrow"),      "Alt+A"),
+                        (crate::i18n::t("矩形","Rect"),       "Alt+R"),
+                        (crate::i18n::t("文字","Text"),       "Alt+T"),
+                        (crate::i18n::t("裁切","Crop"),       "Alt+C"),
+                        (crate::i18n::t("馬賽克","Mosaic"),   "Alt+M"),
+                        (crate::i18n::t("顏色","Color"),      ""),
+                        (crate::i18n::t("複製","Copy"),       "Ctrl+C"),
+                        (crate::i18n::t("儲存","Save"),       "Ctrl+S"),
+                        (crate::i18n::t("另存","Save As"),    "Ctrl+Shift+S"),
+                        (crate::i18n::t("復原","Undo"),       "Ctrl+Z"),
+                        (crate::i18n::t("設定","Settings"),   ""),
                     ];
-                    if let Some(label) = labels.get(btn_hover as usize) {
+                    if let Some((name, shortcut)) = labels.get(btn_hover as usize) {
+                        let label = if shortcut.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{} ({})", name, shortcut)
+                        };
+                        // 動態估算寬度：CJK 字元 ~14px，ASCII ~7px，左右留 8px padding
+                        let cjk = label.chars().filter(|c| !c.is_ascii()).count() as i32;
+                        let asc = label.chars().filter(|c| c.is_ascii()).count() as i32;
+                        let w = (cjk * 14 + asc * 7 + 16).max(80);
                         let text: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
                         SetWindowTextW(state.tooltip, windows::core::PCWSTR(text.as_ptr())).ok();
                         InvalidateRect(state.tooltip, None, false);
                         SetWindowPos(state.tooltip, HWND_TOPMOST,
-                            pt.x + 4, pt.y + 20, 72, 22,
+                            pt.x + 4, pt.y + 20, w, 22,
                             SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE).ok();
                     }
                 }
@@ -1758,7 +1766,6 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
     const SW: i32 = 28; const SG: i32 = 2;
     const PAD: i32 = 4; const COLS: i32 = 6; const ROWS: i32 = 2;
     const CCV: i32 = 22; const SEP: i32 = 8; const TH: i32 = 30;
-    const EW: i32 = 44; const ID_EDIT: i32 = 100; const TIMER_OUTSIDE: usize = 88;
 
     let win_w      = 2 * PAD + COLS * SW + (COLS - 1) * SG;
     let swatches_h = ROWS * SW + (ROWS - 1) * SG;
@@ -1773,10 +1780,10 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
 
     struct CState {
         selected: i32, done: bool,
-        win_w: i32, win_h: i32,
         cc_y: i32, thick_y: i32,
         cur_color_idx: i32,
         preview_thick: i32,
+        preview_color: u32,         // 橫線預覽顏色（初始化為目前 tool_color）
         edit_hwnd: isize,
         initial_btn_released: bool, // 等待開啟時的滑鼠鍵放開，再啟動外部點擊偵測
     }
@@ -1854,15 +1861,16 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
                 MoveToEx(hdc, PAD3, st.thick_y - 4, None);
                 LineTo(hdc, rc.right - PAD3, st.thick_y - 4);
                 SelectObject(hdc, op); DeleteObject(sep);
-                // 橫線預覽（在 EDIT 右側）
+                // 橫線預覽（平頭端點，垂直置中）—— 顏色跟隨目前設定
                 let t = st.preview_thick.clamp(1, 16);
-                let lpen = CreatePen(PS_SOLID, t, COLORREF(0x00_30_30_30));
-                let op2 = SelectObject(hdc, lpen);
                 let lx = PAD3 + EW3 + 8;
                 let ly = st.thick_y + TH3 / 2;
-                MoveToEx(hdc, lx, ly, None);
-                LineTo(hdc, rc.right - PAD3, ly);
-                SelectObject(hdc, op2); DeleteObject(lpen);
+                let line_top = ly - t / 2;
+                let line_rc = RECT { left: lx, top: line_top,
+                    right: rc.right - PAD3, bottom: line_top + t };
+                let lb = CreateSolidBrush(COLORREF(st.preview_color));
+                FillRect(hdc, &line_rc, lb);
+                DeleteObject(lb);
                 SelectObject(hdc, of);
                 EndPaint(hwnd, &ps);
                 LRESULT(0)
@@ -1946,9 +1954,10 @@ unsafe fn simple_color_dialog(owner: HWND, cur_color: u32, cur_thickness: i32) -
     if let Ok(btn) = GetDlgItem(owner, BTN_COLOR as i32) { GetWindowRect(btn, &mut btn_rc).ok(); }
 
     let mut state = CState {
-        selected: -1, done: false, win_w, win_h, cc_y, thick_y,
+        selected: -1, done: false, cc_y, thick_y,
         cur_color_idx,
         preview_thick: cur_thickness.clamp(1, 100),
+        preview_color: cur_color,
         edit_hwnd: 0,
         initial_btn_released: false,
     };
@@ -2002,6 +2011,7 @@ unsafe fn pick_color_with_dialog(owner: HWND, initial: u32) -> Option<u32> {
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows::core::{PCSTR, PCWSTR};
     #[repr(C)]
+    #[allow(non_snake_case)]
     struct CC {
         lStructSize: u32,
         hwndOwner: *mut std::ffi::c_void,
@@ -2032,118 +2042,6 @@ unsafe fn pick_color_with_dialog(owner: HWND, initial: u32) -> Option<u32> {
     if choose(&mut cc) != 0 { Some(cc.rgbResult) } else { None }
 }
 
-/// 自訂粗細數值輸入對話框
-unsafe fn custom_thickness_dialog(owner: HWND, current: i32) -> Option<i32> {
-    let class     = w!("srcshot_thickdlg");
-    let hinstance = get_instance();
-
-    struct TState { value: String, done: bool, ok: bool }
-
-    unsafe extern "system" fn thick_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-        match msg {
-            WM_NCCREATE => {
-                let cs = &*(lp.0 as *const CREATESTRUCTW);
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as _);
-                LRESULT(1)
-            }
-            WM_CREATE => {
-                let hi = get_instance();
-                let label = crate::i18n::tw("線條粗細（1–100 像素）：", "Thickness (1-100 px):");
-                CreateWindowExW(Default::default(), w!("STATIC"),
-                    windows::core::PCWSTR(label.as_ptr()),
-                    WS_CHILD | WS_VISIBLE, 8, 8, 180, 18,
-                    hwnd, HMENU(std::ptr::null_mut()), hi, None).ok();
-                let edit = CreateWindowExW(WS_EX_CLIENTEDGE, w!("EDIT"), w!(""),
-                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(0x2000 | 0x0080), // ES_NUMBER | ES_AUTOHSCROLL
-                    8, 30, 60, 24, hwnd, HMENU(1usize as _), hi, None).unwrap();
-                let st = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TState);
-                let pre: Vec<u16> = st.value.encode_utf16().chain(Some(0)).collect();
-                SetWindowTextW(edit, windows::core::PCWSTR(pre.as_ptr())).ok();
-                let ok_lbl  = crate::i18n::tw("確定", "OK");
-                let ca_lbl  = crate::i18n::tw("取消", "Cancel");
-                CreateWindowExW(Default::default(), w!("BUTTON"),
-                    windows::core::PCWSTR(ok_lbl.as_ptr()),
-                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
-                    8, 62, 72, 26, hwnd, HMENU(2usize as _), hi, None).ok();
-                CreateWindowExW(Default::default(), w!("BUTTON"),
-                    windows::core::PCWSTR(ca_lbl.as_ptr()),
-                    WS_CHILD | WS_VISIBLE,
-                    88, 62, 72, 26, hwnd, HMENU(3usize as _), hi, None).ok();
-                PostMessageW(hwnd, WM_NEXTDLGCTL, WPARAM(edit.0 as usize), LPARAM(1)).ok();
-                LRESULT(0)
-            }
-            WM_COMMAND if (wp.0 & 0xFFFF) == 2 => {
-                let st = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TState);
-                if let Ok(edit) = GetDlgItem(hwnd, 1) {
-                    let n = GetWindowTextLengthW(edit) + 1;
-                    let mut buf = vec![0u16; n as usize];
-                    GetWindowTextW(edit, &mut buf);
-                    st.value = String::from_utf16_lossy(&buf).trim_end_matches('\0').to_string();
-                }
-                st.ok = true; st.done = true;
-                DestroyWindow(hwnd).ok(); LRESULT(0)
-            }
-            WM_COMMAND if (wp.0 & 0xFFFF) == 3 => {
-                let st = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TState);
-                st.done = true; DestroyWindow(hwnd).ok(); LRESULT(0)
-            }
-            WM_CLOSE => {
-                let st = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TState);
-                st.done = true; DestroyWindow(hwnd).ok(); LRESULT(0)
-            }
-            WM_DESTROY => LRESULT(0),
-            _ => DefWindowProcW(hwnd, msg, wp, lp),
-        }
-    }
-
-    let wc = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(thick_proc),
-        hInstance: hinstance,
-        lpszClassName: class,
-        ..Default::default()
-    };
-    let _ = RegisterClassExW(&wc);
-
-    let mut state = TState { value: current.to_string(), done: false, ok: false };
-    let title = crate::i18n::tw("自訂粗細", "Custom Thickness");
-    let dlg = CreateWindowExW(
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        class, windows::core::PCWSTR(title.as_ptr()),
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 200, 130,
-        owner, HMENU(std::ptr::null_mut()), hinstance,
-        Some(&mut state as *mut _ as _),
-    ).unwrap_or(HWND(std::ptr::null_mut()));
-
-    if dlg.0.is_null() { let _ = UnregisterClassW(class, hinstance); return None; }
-
-    let mut msg = MSG::default();
-    while GetMessageW(&mut msg, HWND(std::ptr::null_mut()), 0, 0).as_bool() {
-        if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_RETURN.0 as usize {
-            if let Ok(edit) = GetDlgItem(dlg, 1) {
-                let n = GetWindowTextLengthW(edit) + 1;
-                let mut buf = vec![0u16; n as usize];
-                GetWindowTextW(edit, &mut buf);
-                state.value = String::from_utf16_lossy(&buf).trim_end_matches('\0').to_string();
-            }
-            state.ok = true; state.done = true;
-            DestroyWindow(dlg).ok(); break;
-        }
-        if IsDialogMessageW(dlg, &msg).as_bool() {
-            if state.done { break; }
-            continue;
-        }
-        let _ = TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-        if state.done { break; }
-    }
-    let _ = UnregisterClassW(class, hinstance);
-
-    if state.ok {
-        state.value.trim().parse::<i32>().ok().map(|v| v.clamp(1, 100))
-    } else { None }
-}
 /// 自製 tooltip 視窗的 wnd proc：畫淺黃底 + 文字
 unsafe extern "system" fn tip_wnd_proc(
     hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
@@ -2159,7 +2057,7 @@ unsafe extern "system" fn tip_wnd_proc(
             let bg = CreateSolidBrush(COLORREF(crate::theme::colors().tooltip_bg));
             FillRect(hdc, &rc, bg);
             DeleteObject(bg);
-            let mut buf = [0u16; 32];
+            let mut buf = [0u16; 64];
             let n = GetWindowTextW(hwnd, &mut buf) as usize;
             if n > 0 {
                 SetBkMode(hdc, BACKGROUND_MODE(1)); // TRANSPARENT

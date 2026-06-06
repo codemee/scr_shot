@@ -16,12 +16,10 @@ pub struct ThemeColors {
     pub tab_bar_bg: u32,         // 標籤列外側底色
     pub tab_active: u32,         // 作用中標籤填色
     pub tab_inactive: u32,       // 非作用標籤填色
-    pub tab_border: u32,         // 標籤邊框
     pub tab_text_active: u32,    // 作用中標籤文字
     pub tab_text_inactive: u32,  // 非作用標籤文字
     pub tab_close_btn: u32,      // × 按鈕
     pub btn_icon: u32,           // 圖示按鈕圖示（一般）
-    pub btn_icon_active: u32,    // 圖示按鈕圖示（作用/按下）
     pub canvas_bg: u32,          // 畫布外側灰色區域
     pub tooltip_bg: u32,         // Tooltip 背景
     pub red_dot: u32,            // 未存檔紅點
@@ -137,12 +135,10 @@ pub fn colors() -> ThemeColors {
             tab_bar_bg:         0x00_D8_D8_D8,
             tab_active:         0x00_F0_F0_F0,
             tab_inactive:       0x00_C8_C8_C8,
-            tab_border:         0x00_A8_A8_B8,
             tab_text_active:    0x00_10_10_10,
             tab_text_inactive:  0x00_50_50_50,
             tab_close_btn:      0x00_70_70_70,
             btn_icon:           0x00_40_40_40,
-            btn_icon_active:    0x00_FF_FF_FF,
             canvas_bg:          0x00_B0_B0_B0,
             tooltip_bg:         0x00_E1_FF_FF,
             red_dot:            0x00_00_00_CC,
@@ -152,12 +148,10 @@ pub fn colors() -> ThemeColors {
             tab_bar_bg:         0x00_1E_1E_1E,
             tab_active:         0x00_3D_3D_3D,
             tab_inactive:       0x00_28_28_28,
-            tab_border:         0x00_50_50_60,
             tab_text_active:    0x00_E4_E4_E4,
             tab_text_inactive:  0x00_90_90_90,
             tab_close_btn:      0x00_A0_A0_A0,
             btn_icon:           0x00_C4_C4_C4,
-            btn_icon_active:    0x00_FF_FF_FF,
             canvas_bg:          0x00_3C_3C_3C,
             tooltip_bg:         0x00_3A_3A_3A,
             red_dot:            0x00_40_40_FF,

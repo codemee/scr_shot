@@ -18,7 +18,6 @@ use windows::Win32::Graphics::Gdi::{
     GetDC, GetStockObject, LineTo, MoveToEx, NULL_BRUSH, Polygon, Rectangle,
     ReleaseDC, SelectObject, SetPixel,
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, PS_SOLID, HDC, HBRUSH,
-    ArcTo,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     SetMenuItemInfoW, MENUITEMINFOW, MIIM_BITMAP, HMENU,
@@ -121,15 +120,6 @@ pub unsafe fn apply_at(hmenu: HMENU, pos: u32, icon: &Icon) {
     SetMenuItemInfoW(hmenu, pos, BOOL(1), &mii).ok(); // BOOL(1) = fByPosition
 }
 
-/// AppendMenuW 後立刻套用圖示到剛加入的項目（自動計算位置）
-pub unsafe fn apply_last(hmenu: HMENU, icon: &Icon) {
-    use windows::Win32::UI::WindowsAndMessaging::GetMenuItemCount;
-    let count = GetMenuItemCount(hmenu);
-    if count > 0 {
-        apply_at(hmenu, (count - 1) as u32, icon);
-    }
-}
-
 // ── 具體圖示繪製 ──────────────────────────────────────────────────────────
 
 /// 游標捕獲圖示（切換型）：開啟藍色、關閉灰色
@@ -229,57 +219,6 @@ pub unsafe fn icon_pick_window() -> Icon {
     })
 }
 
-pub unsafe fn icon_cursor() -> Icon {
-    make(|dc, fg| {
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(fg));
-        let br  = CreateSolidBrush(COLORREF(fg));
-        let op  = SelectObject(dc, pen);
-        let ob  = SelectObject(dc, br);
-        // 小游標 + 點線圓
-        let _ = Polygon(dc, &[
-            windows::Win32::Foundation::POINT{x:3,y:2},
-            windows::Win32::Foundation::POINT{x:3,y:9},
-            windows::Win32::Foundation::POINT{x:5,y:7},
-            windows::Win32::Foundation::POINT{x:7,y:11},
-            windows::Win32::Foundation::POINT{x:8,y:10},
-            windows::Win32::Foundation::POINT{x:6,y:6},
-            windows::Win32::Foundation::POINT{x:8,y:5},
-        ]);
-        SelectObject(dc, op); SelectObject(dc, ob);
-        DeleteObject(pen); DeleteObject(br);
-    })
-}
-
-pub unsafe fn icon_clipboard() -> Icon {
-    make(|dc, fg| {
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(fg));
-        let nb  = SelectObject(dc, HBRUSH(GetStockObject(NULL_BRUSH).0));
-        let op  = SelectObject(dc, pen);
-        Rectangle(dc, 3, 4, 12, 13); // 剪貼簿本體
-        // 頂部夾子
-        let _ = MoveToEx(dc, 5, 4, None); let _ = LineTo(dc, 5, 2);
-        let _ = LineTo(dc, 10, 2); let _ = LineTo(dc, 10, 4);
-        SelectObject(dc, op); SelectObject(dc, nb);
-        DeleteObject(pen);
-    })
-}
-
-pub unsafe fn icon_hide() -> Icon {
-    make(|dc, fg| {
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(fg));
-        let nb  = SelectObject(dc, HBRUSH(GetStockObject(NULL_BRUSH).0));
-        let op  = SelectObject(dc, pen);
-        // 眼睛外框弧
-        let _ = MoveToEx(dc, 1, 7, None);
-        let _ = LineTo(dc, 7, 3); let _ = LineTo(dc, 13, 7);
-        let _ = LineTo(dc, 7, 11); let _ = LineTo(dc, 1, 7);
-        // 斜線（表示隱藏）
-        let _ = MoveToEx(dc, 2, 13, None); let _ = LineTo(dc, 12, 3);
-        SelectObject(dc, op); SelectObject(dc, nb);
-        DeleteObject(pen);
-    })
-}
-
 pub unsafe fn icon_clock() -> Icon {
     make(|dc, fg| {
         let pen = CreatePen(PS_SOLID, 1, COLORREF(fg));
@@ -325,44 +264,6 @@ pub unsafe fn icon_theme_auto() -> Icon {
         let nb2 = SelectObject(dc, GetStockObject(NULL_BRUSH));
         Ellipse(dc, 2, 2, 12, 12);
         SelectObject(dc, nb2);
-        SelectObject(dc, op); SelectObject(dc, ob);
-        DeleteObject(pen); DeleteObject(br);
-    })
-}
-
-pub unsafe fn icon_theme_light() -> Icon {
-    make(|dc, fg| {
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(fg));
-        let nb  = SelectObject(dc, HBRUSH(GetStockObject(NULL_BRUSH).0));
-        let op  = SelectObject(dc, pen);
-        Ellipse(dc, 4, 4, 11, 11); // 太陽圓圈
-        // 8 條光線
-        for i in 0..8i32 {
-            let angle = i as f64 * std::f64::consts::PI / 4.0;
-            let (cx, cy) = (7.5f64, 7.5f64);
-            let x1 = (cx + 6.0 * angle.cos()) as i32;
-            let y1 = (cy + 6.0 * angle.sin()) as i32;
-            let _ = MoveToEx(dc, (cx + 4.5*angle.cos()) as i32, (cy + 4.5*angle.sin()) as i32, None);
-            let _ = LineTo(dc, x1, y1);
-        }
-        SelectObject(dc, op); SelectObject(dc, nb);
-        DeleteObject(pen);
-    })
-}
-
-pub unsafe fn icon_theme_dark() -> Icon {
-    make(|dc, fg| {
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(fg));
-        let br  = CreateSolidBrush(COLORREF(fg));
-        let op  = SelectObject(dc, pen);
-        let ob  = SelectObject(dc, br);
-        // 月牙：大圓 - 小偏移圓
-        let _ = BeginPath(dc);
-        let _ = MoveToEx(dc, 11, 3, None);
-        let _ = windows::Win32::Graphics::Gdi::ArcTo(dc, 3,3,11,13, 11,3,11,13);
-        let _ = windows::Win32::Graphics::Gdi::ArcTo(dc, 5,4,11,12, 11,12,11,3);
-        let _ = EndPath(dc);
-        let _ = FillPath(dc);
         SelectObject(dc, op); SelectObject(dc, ob);
         DeleteObject(pen); DeleteObject(br);
     })

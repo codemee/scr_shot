@@ -150,8 +150,7 @@ fn state_machine(
             (AppState::OverlayRegion | AppState::OverlayPick, AppEvent::OverlayCancelled) => {
                 state = AppState::Idle;
             }
-            // EditorSave/EditorCancelled: 舊架構保留，在持久視窗模式下可忽略
-            (_, AppEvent::EditorSave { .. } | AppEvent::EditorCancelled) => {}
+            (_, AppEvent::EditorSave) => {}
             (_, AppEvent::ShowEditor) => {
                 // 雙按系統匣：顯示編輯視窗
                 let hwnd_val = { *editor_hwnd.lock().unwrap() };

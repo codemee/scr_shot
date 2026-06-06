@@ -138,6 +138,29 @@ WindowFromPoint(cursor_screen) → GetDlgCtrlID → 識別是哪個按鈕
 
 **關鍵陷阱**：子視窗（按鈕）擋住父視窗的 `WM_MOUSEMOVE`，父視窗永遠收不到按鈕上方的滑鼠移動事件。
 
+### 編輯器鍵盤快捷鍵（Alt 組合鍵）
+
+工具切換快捷鍵（`Alt+P/A/R/T/C/M`）使用 **`WM_SYSKEYDOWN`** 而非 `WM_KEYDOWN`，原因：
+- `WM_KEYDOWN` 在中文輸入法啟用時，字母鍵訊息會先被輸入法攔截，編輯器無法收到
+- `Alt+字母` 會繞過輸入法直接產生 `WM_SYSKEYDOWN`
+
+**關鍵陷阱**：處理完 `WM_SYSKEYDOWN` 後必須也攔截對應的 `WM_SYSCHAR`（直接回傳 `LRESULT(0)`，不呼叫 `DefWindowProcW`）。原因：`DefWindowProcW` 收到 `WM_SYSCHAR` 時會嘗試配對選單加速鍵，找不到時發出錯誤提示音。
+
+```rust
+WM_SYSKEYDOWN => {
+    // 匹配工具 VK 碼，呼叫 SendMessageW(hwnd, WM_COMMAND, ...) 後回傳 LRESULT(0)
+    // 其他鍵交給 DefWindowProcW（如 Alt+F4 觸發 WM_CLOSE）
+}
+WM_SYSCHAR => {
+    match wp.0 as u8 | 0x20 {  // 大小寫都吞
+        b'p' | b'a' | b'r' | b't' | b'c' | b'm' => LRESULT(0),
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+```
+
+Ctrl 組合鍵（`Ctrl+Z/C/S`）用 `WM_KEYDOWN` 即可，因為 Ctrl 本身就會繞過輸入法。
+
 ### 巢狀 Dialog 不能呼叫 PostQuitMessage
 
 `simple_input_dialog` 的 `WM_DESTROY` **絕不可**呼叫 `PostQuitMessage(0)`。  

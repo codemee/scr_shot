@@ -37,6 +37,22 @@ Each capture opens in a new tab in the persistent editor window:
 | Undo | Undo the last stroke, crop, or mosaic |
 | ≡ Settings | Open settings (shared with tray menu) |
 
+#### Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Alt+P` | Pen |
+| `Alt+A` | Arrow |
+| `Alt+R` | Rectangle |
+| `Alt+T` | Text |
+| `Alt+C` | Crop |
+| `Alt+M` | Mosaic |
+| `Ctrl+Z` | Undo |
+| `Ctrl+C` | Copy to clipboard |
+| `Ctrl+S` | Save |
+| `Ctrl+Shift+S` | Save As |
+| `Esc` | Hide window |
+
 - Each capture opens a new **tab** named with its timestamp (`YYYYMMDDhhmmss`)
 - Window title shows `ezshot-<tab name>`
 - Tabs with unsaved changes show a red dot; it clears on save

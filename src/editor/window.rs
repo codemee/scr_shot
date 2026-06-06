@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     PS_SOLID, SRCCOPY,
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, SetScrollInfo};
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::screen::ScreenBitmap;
@@ -564,10 +564,49 @@ unsafe extern "system" fn editor_wnd_proc(
             }
             LRESULT(0)
         }
-        WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
-            // ESC 只隱藏視窗，所有分頁原封不動保留
-            ShowWindow(hwnd, SW_HIDE);
-            LRESULT(0)
+        WM_SYSKEYDOWN => {
+            // Alt+字母：工具切換（Alt 組合鍵可繞過中文輸入法攔截）
+            let btn: Option<usize> = match wp.0 as u16 {
+                0x50 => Some(BTN_PEN),    // Alt+P
+                0x41 => Some(BTN_ARROW),  // Alt+A
+                0x52 => Some(BTN_RECT),   // Alt+R
+                0x54 => Some(BTN_TEXT),   // Alt+T
+                0x43 => Some(BTN_CROP),   // Alt+C
+                0x4D => Some(BTN_MOSAIC), // Alt+M
+                _ => None,
+            };
+            if let Some(id) = btn {
+                SendMessageW(hwnd, WM_COMMAND, WPARAM(id), LPARAM(0));
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_SYSCHAR => {
+            // 吞掉 Alt+字母 產生的 SYSCHAR，避免 DefWindowProcW 因無對應選單而發出提示音
+            match wp.0 as u8 | 0x20 {
+                b'p' | b'a' | b'r' | b't' | b'c' | b'm' => LRESULT(0),
+                _ => DefWindowProcW(hwnd, msg, wp, lp),
+            }
+        }
+        WM_KEYDOWN => {
+            let vk = wp.0 as u16;
+            if vk == VK_ESCAPE.0 {
+                ShowWindow(hwnd, SW_HIDE);
+                return LRESULT(0);
+            }
+            let ctrl  = GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0;
+            let shift = GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 != 0;
+            let btn: Option<usize> = match (ctrl, shift, vk) {
+                (true, false, 0x5A) => Some(BTN_UNDO),  // Ctrl+Z
+                (true, false, 0x43) => Some(BTN_COPY),  // Ctrl+C
+                (true, false, 0x53) => Some(BTN_SAVE),  // Ctrl+S
+                (true, true,  0x53) => Some(BTN_SAVEAS),// Ctrl+Shift+S
+                _ => None,
+            };
+            if let Some(id) = btn {
+                SendMessageW(hwnd, WM_COMMAND, WPARAM(id), LPARAM(0));
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_LBUTTONDOWN => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);

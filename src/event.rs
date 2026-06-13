@@ -3,6 +3,7 @@ use windows::Win32::Foundation::RECT;
 #[derive(Debug)]
 pub enum AppEvent {
     CaptureRegion,
+    CaptureFullscreen,
     CaptureActiveWindow,
     CapturePickWindow,
     OverlayCancelled,

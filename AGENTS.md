@@ -43,13 +43,14 @@ spawn 的執行緒（短暫存活）
 
 ```
 Idle
-  ├─(Alt+Shift+R)→ OverlayRegion → RegionSelected → Editing
-  ├─(Alt+Shift+A)→                                   Editing
-  └─(Alt+Shift+W)→ OverlayPick  → WindowPicked    → Editing
+  ├─(Alt+Shift+R)→ OverlayRegion    → RegionSelected → Editing
+  ├─(Alt+Shift+F)→                                      Editing
+  ├─(Alt+Shift+A)→                                      Editing
+  └─(Alt+Shift+W)→ OverlayPick     → WindowPicked    → Editing
                                    OverlayCancelled → Idle
 Editing
   ├─ EditorSave / EditorCancelled → Idle
-  └─ X 按鈕關閉：WM_DESTROY 補送 EditorCancelled，確保回到 Idle
+  └─ X 按鈕關閉：`WM_CLOSE` → `close_all_tabs()`，清空分頁後 `SW_HIDE`，不銷毀編輯器
 ```
 
 非法轉換（如 Editing 狀態收到 CaptureRegion）直接 `_ => {}` 忽略。
@@ -61,8 +62,8 @@ Editing
 | `event.rs` | `AppEvent` enum，跨執行緒傳遞的唯一溝通介面 |
 | `app.rs` | 狀態機 + 主 Win32 message loop |
 | `tray.rs` | Shell_NotifyIcon、右鍵選單；WM_HOTKEY 轉發給 hotkey 模組 |
-| `hotkey.rs` | RegisterHotKey/UnregisterHotKey，三組快捷鍵 |
-| `capture/screen.rs` | GDI BitBlt 截圖；active_window_rect()、window_rect(HWND)；視窗範圍優先用 DWM 可見邊界 |
+| `hotkey.rs` | RegisterHotKey/UnregisterHotKey，四組快捷鍵 |
+| `capture/screen.rs` | GDI BitBlt 截圖；fullscreen_rect()、active_window_rect()、window_rect(HWND)；視窗範圍優先用 DWM 可見邊界 |
 | `capture/overlay.rs` | 兩種 overlay 視窗（框選/點選），各自有內部 message loop |
 | `editor/canvas.rs` | ScreenBitmap + 標註疊加，`flatten_to_bitmap()` 輸出最終影像 |
 | `editor/tool.rs` | `Stroke` enum（Pen/Arrow/Rect/Text/Crop），各工具 GDI 繪製邏輯；`Stroke::translate()` 供裁切後座標平移 |
@@ -114,9 +115,17 @@ Editing
 
 **不可**同時使用 `SetLayeredWindowAttributes`，兩種模式互斥。
 
-`find_window_at(overlay, pt)` 用 `EnumWindows` 枚舉頂層視窗取代 `WindowFromPoint`，原因：`WindowFromPoint` 會傳回子視窗（按鈕、捲軸），導致高亮錯誤視窗。若多個可見頂層視窗同時包含游標座標，選面積最小者，避免先命中全螢幕宿主或大型背景視窗。
+`find_window_at(overlay, pt)` 用 `EnumWindows` 枚舉頂層視窗取代 `WindowFromPoint`，原因：`WindowFromPoint` 會傳回子視窗（按鈕、捲軸），導致高亮錯誤視窗。候選 HWND 依 `EnumWindows` 的 z-order 順序，套用近似 Alt-Tab 的規則：無 owner、非 `WS_EX_TOOLWINDOW`、非 DWM cloaked，且 `GetAncestor(GA_ROOTOWNER)` / `GetLastActivePopup` 判定為可切換主視窗，再要求 `WS_EX_APPWINDOW` 或 title + `WS_SYSMENU`。不可用「面積最小」當主要 tie-breaker，也不可 fallback 到非 Alt-Tab 視窗，否則會選到 Chrome/Gmail/Facebook/Spotify/Codex 內部 popup widget 這類「不存在的視窗」，甚至取得超出主視窗的 DWM bounds。
 
 hover 橘框與 `screen::window_rect(hwnd)` 都優先使用 `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` 取得可見視窗邊界，失敗才退回 `GetWindowRect`。這可避免 Windows invisible resize border 被截進點選視窗 / 作用中視窗圖片。
+
+`Alt+Shift+W` 同時涵蓋一般視窗與子視窗 / 控制項擷取：先用一般 pick 規則找出 app 主視窗，再用 `ScreenToClient(parent, pt)` + `ChildWindowFromPointEx(CWP_SKIPINVISIBLE | CWP_SKIPDISABLED)` 逐層往下找最深層 child HWND。這個模式可以選完整視窗，也可以選工具列、按鈕等子視窗；不可再額外維護獨立的子視窗快捷鍵，避免兩套 pick 邏輯分岔。
+
+標準視窗右上角最小化 / 最大化 / 關閉按鈕通常是 non-client area，不是 child HWND，`ChildWindowFromPointEx` 抓不到。曾嘗試用 `WM_GETTITLEBARINFOEX` / `TITLEBARINFOEX.rgrect` 偵測 caption button，但在現代 app / Chromium / WinUI 上判斷不穩；目前不支援個別擷取這些 caption button，避免誤框。
+
+Overlay 開啟後若使用者按 Alt+Tab，overlay 可能失去鍵盤焦點，導致收不到 `WM_KEYDOWN VK_ESCAPE`。region / pick overlay 都必須安裝 `WH_KEYBOARD_LL` low-level keyboard hook 攔截 ESC：偵測到 `VK_ESCAPE` 時 `PostMessageW(WM_OVERLAY_CANCEL)` 並回傳 `LRESULT(1)` 吃掉按鍵，避免 ESC 傳給目前有焦點的其他視窗。`WM_TIMER` + `GetAsyncKeyState(VK_ESCAPE)` 只作為備援取消；取消時送 `OverlayCancelled`、`ReleaseCapture()`、`PostMessageW(WM_CLOSE)`。
+
+Pick overlay 另外安裝 `WH_MOUSE_LL` low-level mouse hook。雖然透明孔用 alpha=1 盡量保留 hit-testing，但在 caption button / non-client area（例如右上角關閉鈕）仍可能偶發穿透到底下視窗。pick 模式必須吃掉 `WM_LBUTTONDOWN` / `WM_LBUTTONUP`；放開時 `PostMessageW(WM_OVERLAY_PICK_CLICK)`，由 overlay 重新計算游標下的 HWND 後送 `WindowPicked`，避免點到下方視窗的關閉鈕真的關掉目標程式。
 
 ### 編輯器工具列
 
@@ -251,10 +260,13 @@ Undo 系統採 `UndoOp` enum：
 | 觸發動作 | 行為 |
 |----------|------|
 | 點分頁 × | `close_tab_with_confirm`：3 按鈕扁平對話框（儲存 / 不儲存 / 取消） |
-| 視窗 × / ≡ 關閉所有頁籤 | `close_all_tabs`：逐分頁詢問，含「通通不存檔」選項；完成後隱藏視窗 |
-| ESC | 直接隱藏，不詢問 |
+| 視窗 × / ≡ 關閉所有頁籤 | `close_all_tabs`：逐分頁詢問，含「通通不存檔」選項；清空分頁後隱藏到系統匣 |
+| 最小化 | 使用 Win32 預設最小化行為，縮小到工作列並保留所有分頁 |
+| ESC | 主編輯視窗不處理 ESC；只允許對話框 / 下拉面板用 ESC 取消局部操作 |
+| 系統匣右鍵結束 | 唯一真正關閉程式的路徑，送 `WM_FORCE_QUIT` 銷毀編輯器 |
 
 `WM_PAINT` 的畫布渲染區段加了 `&& !state.tabs.is_empty()` 守衛，防止分頁清空後重繪時越界崩潰。
+`WM_SIZE` / 捲軸 / owner-draw 工具列也必須允許 `state.tabs.is_empty()`。`close_all_tabs()` 會先清空分頁再 `ShowWindow(SW_HIDE)`，而隱藏視窗會補送 resize / paint / draw 訊息；這些路徑不可直接讀 `tabs[active_tab]`，否則按視窗 X 看起來會把程式關掉。
 
 ### 扁平確認對話框（flat_dlg_paint / flat_dlg_drawbtn）
 
@@ -309,7 +321,7 @@ SetWindowPos(hwnd, HWND_NOTOPMOST, ..., SWP_NOMOVE|SWP_NOSIZE);
 
 - `SetScrollInfo`、`DRAWITEMSTRUCT` 在 `Win32_UI_Controls`，**不在** `Win32_UI_WindowsAndMessaging`
 - `SetFocus`、`GetCapture`、`SetCapture`、`VK_*` 在 `Win32_UI_Input_KeyboardAndMouse`，不在 glob
-- `ScreenToClient`、`ClientToScreen` 不在 `WindowsAndMessaging` glob；改用 `GetMessagePos()` + `GetWindowRect()` 計算
+- `ScreenToClient`、`ClientToScreen` 不在 `WindowsAndMessaging` glob；若需要使用，從 `Win32_Graphics_Gdi` 匯入
 - `CheckMenuRadioItem`、`CheckMenuItem` 的 flags 參數型別是 `u32`，非 `MENU_ITEM_FLAGS`（須用 `.0`）
 - `TOOLINFOW` 在 windows-rs 0.58 中名為 `TTTOOLINFOW`
 - `WM_HSCROLL`/`WM_VSCROLL` 的 code（SB_LINEUP 等）型別是 `SCROLLBAR_COMMAND`，match 時須用 `.0` 或整數字面值

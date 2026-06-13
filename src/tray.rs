@@ -16,6 +16,7 @@ pub const WM_TRAY: u32 = WM_APP + 1;
 const IDM_REGION:  u32 = 100;
 const IDM_ACTIVE:  u32 = 101;
 const IDM_PICK:    u32 = 102;
+const IDM_FULLSCREEN: u32 = 103;
 const IDM_CURSOR:         u32 = 110;
 const IDM_AUTO_COPY:      u32 = 111;
 const IDM_HIDE_ON_CAPTURE: u32 = 112;
@@ -143,6 +144,7 @@ unsafe extern "system" fn msg_wnd_proc(
                 IDM_REGION => { let _ = data.tx.send(AppEvent::CaptureRegion); }
                 IDM_ACTIVE => { let _ = data.tx.send(AppEvent::CaptureActiveWindow); }
                 IDM_PICK   => { let _ = data.tx.send(AppEvent::CapturePickWindow); }
+                IDM_FULLSCREEN => { let _ = data.tx.send(AppEvent::CaptureFullscreen); }
                 IDM_CURSOR => {
                     let mut c = data.config.lock().unwrap();
                     c.capture_cursor = !c.capture_cursor;
@@ -250,9 +252,11 @@ unsafe fn show_context_menu(hwnd: HWND) {
 
     // ── 擷取方式 ──
     let s_region = tw("框選區域 (Alt+Shift+R)", "Capture Region (Alt+Shift+R)");
+    let s_full   = tw("全螢幕 (Alt+Shift+F)", "Fullscreen (Alt+Shift+F)");
     let s_active = tw("作用中視窗 (Alt+Shift+A)", "Active Window (Alt+Shift+A)");
-    let s_pick   = tw("點選視窗 (Alt+Shift+W)", "Pick Window (Alt+Shift+W)");
+    let s_pick   = tw("點選視窗 / 控制項 (Alt+Shift+W)", "Pick Window / Control (Alt+Shift+W)");
     let _ = AppendMenuW(hmenu, MF_STRING, IDM_REGION as usize, windows::core::PCWSTR(s_region.as_ptr()));
+    let _ = AppendMenuW(hmenu, MF_STRING, IDM_FULLSCREEN as usize, windows::core::PCWSTR(s_full.as_ptr()));
     let _ = AppendMenuW(hmenu, MF_STRING, IDM_ACTIVE as usize, windows::core::PCWSTR(s_active.as_ptr()));
     let _ = AppendMenuW(hmenu, MF_STRING, IDM_PICK   as usize, windows::core::PCWSTR(s_pick.as_ptr()));
     let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);

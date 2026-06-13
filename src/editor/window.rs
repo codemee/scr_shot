@@ -40,6 +40,7 @@ const BTN_MARGIN: i32 = 4;
 const CM_CAPTURE_REGION:  u32 = 3001;
 const CM_CAPTURE_ACTIVE:  u32 = 3002;
 const CM_CAPTURE_PICK:    u32 = 3003;
+const CM_CAPTURE_FULLSCREEN: u32 = 3004;
 const CM_TOGGLE_CURSOR:   u32 = 3010;
 const CM_TOGGLE_AUTOCOPY: u32 = 3011;
 const CM_DELAY_0:  u32 = 3200; const CM_DELAY_1: u32 = 3201;
@@ -263,6 +264,17 @@ unsafe fn update_scrollbars(hwnd: HWND, state: &EditorState) {
     let mut rc = RECT::default();
     GetClientRect(hwnd, &mut rc).unwrap();
 
+    if state.tabs.is_empty() {
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let new_style = style & !WS_HSCROLL.0 & !WS_VSCROLL.0;
+        if new_style != style {
+            SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
+            SetWindowPos(hwnd, None, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED).ok();
+        }
+        return;
+    }
+
     // 根據 canvas vs client 決定是否需要捲軸
     let need_h = state.tabs[state.active_tab].canvas.width  > rc.right;
     let need_v = state.tabs[state.active_tab].canvas.height > (rc.bottom - CANVAS_Y);
@@ -324,13 +336,17 @@ unsafe extern "system" fn editor_wnd_proc(
             LRESULT(1)
         }
         WM_SIZE => {
-            let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
-            update_scrollbars(hwnd, state);
-            InvalidateRect(hwnd, None, false);
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState;
+            if !ptr.is_null() {
+                let state = &*ptr;
+                update_scrollbars(hwnd, state);
+                InvalidateRect(hwnd, None, false);
+            }
             LRESULT(0)
         }
         WM_HSCROLL => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+            if state.tabs.is_empty() { return LRESULT(0); }
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc).unwrap();
             let client_w = rc.right;
@@ -356,6 +372,7 @@ unsafe extern "system" fn editor_wnd_proc(
         }
         WM_VSCROLL => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+            if state.tabs.is_empty() { return LRESULT(0); }
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc).unwrap();
             let client_h = rc.bottom - CANVAS_Y;
@@ -381,6 +398,7 @@ unsafe extern "system" fn editor_wnd_proc(
         }
         WM_MOUSEWHEEL => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+            if state.tabs.is_empty() { return LRESULT(0); }
             let delta = ((wp.0 >> 16) as u16) as i16;
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc).unwrap();
@@ -588,10 +606,6 @@ unsafe extern "system" fn editor_wnd_proc(
         }
         WM_KEYDOWN => {
             let vk = wp.0 as u16;
-            if vk == VK_ESCAPE.0 {
-                ShowWindow(hwnd, SW_HIDE);
-                return LRESULT(0);
-            }
             let ctrl  = GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0;
             let shift = GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 != 0;
             let btn: Option<usize> = match (ctrl, shift, vk) {
@@ -966,7 +980,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 }
             };
             let saveas_disabled = id == BTN_SAVEAS
-                && state.tabs[state.active_tab].saved_path.is_none();
+                && (state.tabs.is_empty() || state.tabs[state.active_tab].saved_path.is_none());
             let text_color = match id {
                 _ if saveas_disabled => windows::Win32::Foundation::COLORREF(0x00_C0_C0_C0), // 禁用灰
                 _ if is_active_tool || is_pressed => windows::Win32::Foundation::COLORREF(0x00_FF_FF_FF),
@@ -1016,8 +1030,14 @@ unsafe extern "system" fn editor_wnd_proc(
                     let _ = MoveToEx(hdc, cx,   cy-5, None); let _ = LineTo(hdc, cx,   cy+5);
                 }
                 BTN_COLOR => {
-                    let tool_color = state.tabs[state.active_tab].canvas.tool_color;
-                    let tool_thick = state.tabs[state.active_tab].canvas.tool_thickness;
+                    let (tool_color, tool_thick) = if state.tabs.is_empty() {
+                        (0x00_00_78_D4, 2)
+                    } else {
+                        (
+                            state.tabs[state.active_tab].canvas.tool_color,
+                            state.tabs[state.active_tab].canvas.tool_thickness,
+                        )
+                    };
                     // ▼ 小箭頭在左側，垂直置中
                     let ax = rc.left + 7;
                     let ap = CreatePen(PS_SOLID, 1, COLORREF(0x00_40_40_40));
@@ -2187,8 +2207,9 @@ unsafe fn show_editor_popup(hwnd: HWND, state: &EditorState, sx: i32, sy: i32) {
     let hmenu = CreatePopupMenu().unwrap();
     // ── 捕獲方式 ──
     let _ = AppendMenuW(hmenu, MF_STRING, CM_CAPTURE_REGION as usize, w!("框選區域 (Alt+Shift+R)"));
+    let _ = AppendMenuW(hmenu, MF_STRING, CM_CAPTURE_FULLSCREEN as usize, w!("全螢幕 (Alt+Shift+F)"));
     let _ = AppendMenuW(hmenu, MF_STRING, CM_CAPTURE_ACTIVE as usize, w!("作用中視窗 (Alt+Shift+A)"));
-    let _ = AppendMenuW(hmenu, MF_STRING, CM_CAPTURE_PICK   as usize, w!("點選視窗 (Alt+Shift+W)"));
+    let _ = AppendMenuW(hmenu, MF_STRING, CM_CAPTURE_PICK   as usize, w!("點選視窗 / 控制項 (Alt+Shift+W)"));
     let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
     // ── 設定 ──
     let cf = if capture_cursor { MF_STRING | MF_CHECKED } else { MF_STRING };
@@ -2226,6 +2247,7 @@ unsafe fn show_editor_popup(hwnd: HWND, state: &EditorState, sx: i32, sy: i32) {
 unsafe fn handle_context_menu_cmd(hwnd: HWND, state: &mut EditorState, id: u32) {
     match id {
         CM_CAPTURE_REGION => { let _ = state.tx.send(crate::event::AppEvent::CaptureRegion); }
+        CM_CAPTURE_FULLSCREEN => { let _ = state.tx.send(crate::event::AppEvent::CaptureFullscreen); }
         CM_CAPTURE_ACTIVE => { let _ = state.tx.send(crate::event::AppEvent::CaptureActiveWindow); }
         CM_CAPTURE_PICK   => { let _ = state.tx.send(crate::event::AppEvent::CapturePickWindow); }
         CM_TOGGLE_CURSOR  => {

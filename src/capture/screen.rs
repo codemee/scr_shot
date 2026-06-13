@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowRect,
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     CURSORINFO, CURSOR_SHOWING, GetCursorInfo, GetIconInfo, ICONINFO,
     DrawIconEx, DI_NORMAL, HICON,
 };
@@ -101,6 +102,22 @@ pub fn active_window_rect() -> Result<RECT> {
         let hwnd = GetForegroundWindow();
         anyhow::ensure!(!hwnd.is_invalid(), "no foreground window");
         visible_window_rect(hwnd)
+    }
+}
+
+pub fn fullscreen_rect() -> Result<RECT> {
+    unsafe {
+        let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        anyhow::ensure!(width > 0 && height > 0, "empty virtual screen");
+        Ok(RECT {
+            left,
+            top,
+            right: left + width,
+            bottom: top + height,
+        })
     }
 }
 

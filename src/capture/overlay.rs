@@ -1,8 +1,9 @@
 use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use windows::core::w;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Gdi::{
     BACKGROUND_MODE, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
@@ -10,14 +11,19 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, DIB_RGB_COLORS, DRAW_TEXT_FORMAT,
     DrawTextW, Ellipse, EndPaint, FillRect,
     GetDC, GetStockObject, InvalidateRect, NULL_BRUSH, PAINTSTRUCT, PS_SOLID,
-    ReleaseDC, SelectObject, SetBkMode, SetTextColor, UpdateWindow, HBRUSH,
+    ReleaseDC, ScreenToClient, SelectObject, SetBkMode, SetTextColor, UpdateWindow, HBRUSH,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, VK_ESCAPE,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::event::AppEvent;
+
+const WM_OVERLAY_CANCEL: u32 = WM_APP + 50;
+const WM_OVERLAY_PICK_CLICK: u32 = WM_APP + 51;
+static OVERLAY_CANCEL_HWND: AtomicIsize = AtomicIsize::new(0);
+static PICK_MOUSE_HWND: AtomicIsize = AtomicIsize::new(0);
 
 // ─── Region selection ────────────────────────────────────────────────────────
 
@@ -84,7 +90,10 @@ pub fn show_region(tx: Sender<AppEvent>) {
         // 立即設定游標，避免視窗建立瞬間顯示忙碌圖示
         SetCursor(LoadCursorW(None, IDC_CROSS).unwrap());
         SetCapture(hwnd);
+        SetTimer(hwnd, 1, 50, None);
+        let esc_hook = install_escape_hook(hwnd);
         run_modal();
+        uninstall_escape_hook(esc_hook);
         let _ = UnregisterClassW(class, hinstance);
     }
 }
@@ -104,9 +113,19 @@ unsafe extern "system" fn region_wnd_proc(
         }
         WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
             let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RegionState);
-            let _ = state.tx.send(AppEvent::OverlayCancelled);
-            ReleaseCapture().unwrap();
-            PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
+            cancel_overlay(hwnd, &state.tx);
+            LRESULT(0)
+        }
+        WM_OVERLAY_CANCEL => {
+            let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RegionState);
+            cancel_overlay(hwnd, &state.tx);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RegionState);
+            if escape_pressed() {
+                cancel_overlay(hwnd, &state.tx);
+            }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -189,6 +208,7 @@ unsafe extern "system" fn region_wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            KillTimer(hwnd, 1);
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RegionState;
             if !ptr.is_null() {
                 drop(Box::from_raw(ptr));
@@ -256,7 +276,11 @@ pub fn show_pick(tx: Sender<AppEvent>) {
         SetCursor(LoadCursorW(None, IDC_CROSS).unwrap());
         SetCapture(hwnd);
         SetTimer(hwnd, 1, 50, None); // 50ms 備援輪詢
+        let esc_hook = install_escape_hook(hwnd);
+        let mouse_hook = install_pick_mouse_hook(hwnd);
         run_modal();
+        uninstall_pick_mouse_hook(mouse_hook);
+        uninstall_escape_hook(esc_hook);
         let _ = UnregisterClassW(class, hinstance);
     }
 }
@@ -276,19 +300,19 @@ unsafe extern "system" fn pick_wnd_proc(
         }
         WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
             let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickState);
-            let _ = state.tx.send(AppEvent::OverlayCancelled);
-            ReleaseCapture().unwrap();
-            PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
+            cancel_overlay(hwnd, &state.tx);
+            LRESULT(0)
+        }
+        WM_OVERLAY_CANCEL => {
+            let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickState);
+            cancel_overlay(hwnd, &state.tx);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickState);
             let (sx, sy) = cursor_screen_pos();
             let pt = POINT { x: sx, y: sy };
-
-            // 用 EnumWindows 枚舉頂層視窗，跳過 overlay 自身
-            // 不需要 hide/show，完全消除閃爍
-            let target = find_window_at(hwnd, pt);
+            let target = find_pick_target_at(hwnd, pt);
 
             if target != state.hover {
                 state.hover = target;
@@ -297,24 +321,25 @@ unsafe extern "system" fn pick_wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickState);
-            // 先隱藏 overlay，讓 GDI 恢復畫面，再截圖（同 region overlay 的做法）
-            ShowWindow(hwnd, SW_HIDE);
-            if !state.hover.is_invalid() {
-                let _ = state.tx.send(AppEvent::WindowPicked(state.hover.0 as isize));
-            } else {
-                let _ = state.tx.send(AppEvent::OverlayCancelled);
-            }
-            ReleaseCapture().unwrap();
-            PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
+            let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickState);
+            finish_pick(hwnd, state);
+            LRESULT(0)
+        }
+        WM_OVERLAY_PICK_CLICK => {
+            let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickState);
+            finish_pick(hwnd, state);
             LRESULT(0)
         }
         WM_TIMER => {
-            // 備援輪詢：更新 hover（當 WM_MOUSEMOVE 因某原因未送達時的後備）
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PickState);
+            if escape_pressed() {
+                cancel_overlay(hwnd, &state.tx);
+                return LRESULT(0);
+            }
+            // 備援輪詢：更新 hover（當 WM_MOUSEMOVE 因某原因未送達時的後備）
             let (sx, sy) = cursor_screen_pos();
             let pt = POINT { x: sx, y: sy };
-            let target = find_window_at(hwnd, pt);
+            let target = find_pick_target_at(hwnd, pt);
             if target != state.hover {
                 state.hover = target;
                 pick_update_overlay(hwnd, target);
@@ -341,32 +366,20 @@ unsafe fn find_window_at(overlay: HWND, pt: POINT) -> HWND {
         pt: POINT,
         overlay: HWND,
         result: HWND,
-        result_area: i64,
     }
 
     unsafe extern "system" fn enum_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
         let ctx = &mut *(lp.0 as *mut Ctx);
-        if hwnd == ctx.overlay { return BOOL(1); }          // 跳過 overlay 自身
+        if hwnd == ctx.overlay { return BOOL(1); }
         if !IsWindowVisible(hwnd).as_bool() { return BOOL(1); }
-        let mut rc = RECT::default();
-        if GetWindowRect(hwnd, &mut rc).is_err() { return BOOL(1); }
-        if rc.right <= rc.left || rc.bottom <= rc.top { return BOOL(1); } // 跳過零尺寸視窗
-        // 跳過桌面背景視窗（Progman = 傳統桌面，WorkerW = 含小工具的桌面）
-        let mut cls = [0u16; 32];
-        let cn = GetClassNameW(hwnd, &mut cls) as usize;
-        if cn > 0 {
-            let name = String::from_utf16_lossy(&cls[..cn]);
-            if name == "Progman" || name == "WorkerW" {
-                return BOOL(1);
-            }
-        }
+        if is_desktop_window(hwnd) { return BOOL(1); }
+        if !is_pickable_app_window(hwnd) { return BOOL(1); }
+
+        let Some(rc) = visible_window_rect(hwnd) else { return BOOL(1); };
         let pt = ctx.pt;
         if pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom {
-            let area = (rc.right - rc.left) as i64 * (rc.bottom - rc.top) as i64;
-            if ctx.result.is_invalid() || area < ctx.result_area {
-                ctx.result = hwnd;
-                ctx.result_area = area;
-            }
+            ctx.result = hwnd;
+            return BOOL(0);
         }
         BOOL(1)
     }
@@ -375,10 +388,178 @@ unsafe fn find_window_at(overlay: HWND, pt: POINT) -> HWND {
         pt,
         overlay,
         result: HWND(std::ptr::null_mut()),
-        result_area: i64::MAX,
     };
     let _ = EnumWindows(Some(enum_cb), LPARAM(&mut ctx as *mut _ as isize));
     ctx.result
+}
+
+unsafe fn escape_pressed() -> bool {
+    (GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8000) != 0
+}
+
+unsafe fn cancel_overlay(hwnd: HWND, tx: &Sender<AppEvent>) {
+    let _ = tx.send(AppEvent::OverlayCancelled);
+    ReleaseCapture().ok();
+    PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+}
+
+unsafe fn finish_pick(hwnd: HWND, state: &mut PickState) {
+    let (sx, sy) = cursor_screen_pos();
+    let pt = POINT { x: sx, y: sy };
+    state.hover = find_pick_target_at(hwnd, pt);
+
+    // 先隱藏 overlay，讓 GDI 恢復畫面，再截圖（同 region overlay 的做法）
+    ShowWindow(hwnd, SW_HIDE);
+    if !state.hover.is_invalid() {
+        let _ = state.tx.send(AppEvent::WindowPicked(state.hover.0 as isize));
+    } else {
+        let _ = state.tx.send(AppEvent::OverlayCancelled);
+    }
+    ReleaseCapture().ok();
+    PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+}
+
+unsafe fn install_escape_hook(hwnd: HWND) -> Option<HHOOK> {
+    OVERLAY_CANCEL_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+    SetWindowsHookExW(WH_KEYBOARD_LL, Some(overlay_keyboard_proc), None, 0).ok()
+}
+
+unsafe fn uninstall_escape_hook(hook: Option<HHOOK>) {
+    OVERLAY_CANCEL_HWND.store(0, Ordering::SeqCst);
+    if let Some(hook) = hook {
+        UnhookWindowsHookEx(hook).ok();
+    }
+}
+
+unsafe fn install_pick_mouse_hook(hwnd: HWND) -> Option<HHOOK> {
+    PICK_MOUSE_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+    SetWindowsHookExW(WH_MOUSE_LL, Some(pick_mouse_proc), None, 0).ok()
+}
+
+unsafe fn uninstall_pick_mouse_hook(hook: Option<HHOOK>) {
+    PICK_MOUSE_HWND.store(0, Ordering::SeqCst);
+    if let Some(hook) = hook {
+        UnhookWindowsHookEx(hook).ok();
+    }
+}
+
+unsafe extern "system" fn overlay_keyboard_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && (wp.0 as u32 == WM_KEYDOWN || wp.0 as u32 == WM_SYSKEYDOWN) {
+        let kb = &*(lp.0 as *const KBDLLHOOKSTRUCT);
+        if kb.vkCode == VK_ESCAPE.0 as u32 {
+            let hwnd_raw = OVERLAY_CANCEL_HWND.load(Ordering::SeqCst);
+            if hwnd_raw != 0 {
+                let hwnd = HWND(hwnd_raw as *mut _);
+                PostMessageW(hwnd, WM_OVERLAY_CANCEL, WPARAM(0), LPARAM(0)).ok();
+                return LRESULT(1);
+            }
+        }
+    }
+    CallNextHookEx(HHOOK(std::ptr::null_mut()), code, wp, lp)
+}
+
+unsafe extern "system" fn pick_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let msg = wp.0 as u32;
+        if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP {
+            let hwnd_raw = PICK_MOUSE_HWND.load(Ordering::SeqCst);
+            if hwnd_raw != 0 {
+                if msg == WM_LBUTTONUP {
+                    let hwnd = HWND(hwnd_raw as *mut _);
+                    PostMessageW(hwnd, WM_OVERLAY_PICK_CLICK, WPARAM(0), LPARAM(0)).ok();
+                }
+                return LRESULT(1);
+            }
+        }
+    }
+    CallNextHookEx(HHOOK(std::ptr::null_mut()), code, wp, lp)
+}
+
+/// 找出游標下方最適合擷取的 HWND：先鎖定 app 主視窗，再往下找最深層可見 child HWND。
+unsafe fn find_pick_target_at(overlay: HWND, pt: POINT) -> HWND {
+    let root = find_window_at(overlay, pt);
+    if root.is_invalid() {
+        return HWND(std::ptr::null_mut());
+    }
+
+    let mut current = root;
+    loop {
+        let mut child_pt = pt;
+        if !ScreenToClient(current, &mut child_pt).as_bool() {
+            return current;
+        }
+        let child = ChildWindowFromPointEx(
+            current,
+            child_pt,
+            CWP_SKIPINVISIBLE | CWP_SKIPDISABLED,
+        );
+        if child.is_invalid() || child == current {
+            return current;
+        }
+        current = child;
+    }
+}
+
+unsafe fn is_desktop_window(hwnd: HWND) -> bool {
+    let mut cls = [0u16; 64];
+    let cn = GetClassNameW(hwnd, &mut cls) as usize;
+    if cn == 0 { return false; }
+    matches!(
+        String::from_utf16_lossy(&cls[..cn]).as_str(),
+        "Progman" | "WorkerW"
+    )
+}
+
+unsafe fn is_pickable_app_window(hwnd: HWND) -> bool {
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
+        return false;
+    }
+    if GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.is_invalid()) {
+        return false;
+    }
+    if is_cloaked_window(hwnd) {
+        return false;
+    }
+    if !is_alt_tab_window(hwnd) {
+        return false;
+    }
+    if (ex_style & WS_EX_APPWINDOW.0) != 0 {
+        return true;
+    }
+
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    GetWindowTextLengthW(hwnd) > 0 && (style & WS_SYSMENU.0) != 0
+}
+
+unsafe fn is_alt_tab_window(hwnd: HWND) -> bool {
+    let mut walk = GetAncestor(hwnd, GA_ROOTOWNER);
+    if walk.is_invalid() {
+        walk = hwnd;
+    }
+
+    loop {
+        let try_hwnd = GetLastActivePopup(walk);
+        if try_hwnd == walk {
+            break;
+        }
+        if IsWindowVisible(try_hwnd).as_bool() {
+            break;
+        }
+        walk = try_hwnd;
+    }
+
+    walk == hwnd
+}
+
+unsafe fn is_cloaked_window(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut _ as *mut _,
+        std::mem::size_of::<u32>() as u32,
+    ).is_ok() && cloaked != 0
 }
 
 unsafe fn visible_window_rect(hwnd: HWND) -> Option<RECT> {

@@ -77,6 +77,34 @@ fn state_machine(
                     overlay::show_pick(tx2);
                 });
             }
+            (AppState::Idle, AppEvent::CaptureFullscreen) => {
+                let tx2  = tx.clone();
+                let dir  = save_dir.clone();
+                let (delay, cursor, auto_copy, hide) = {
+                    let c = config.lock().unwrap();
+                    (c.capture_delay_secs, c.capture_cursor, c.auto_copy, c.hide_editor_on_capture)
+                };
+                let editor_clone = editor_hwnd.clone();
+                let config_clone = config.clone();
+                let eh = if hide { Some(editor_hwnd.clone()) } else { None };
+                std::thread::spawn(move || {
+                    if let Some(eh) = eh { hide_editor_if_needed(&eh); }
+                    match screen::fullscreen_rect() {
+                        Ok(rect) => {
+                            if delay > 0 {
+                                overlay::show_countdown(delay, Some(rect));
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(80));
+                            }
+                            match screen::capture_rect(rect, cursor) {
+                                Ok(bmp) => dispatch_capture(bmp, auto_copy, tx2, dir, editor_clone, config_clone),
+                                Err(e) => { eprintln!("capture error: {e}"); }
+                            }
+                        }
+                        Err(e) => { eprintln!("capture error: {e}"); }
+                    }
+                });
+            }
             (AppState::Idle, AppEvent::CaptureActiveWindow) => {
                 let tx2  = tx.clone();
                 let dir  = save_dir.clone();

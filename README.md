@@ -11,8 +11,9 @@ A Windows screenshot tool that lives in the system tray, with global hotkeys, an
 | Hotkey | Mode |
 |--------|------|
 | `Alt+Shift+R` | Drag to select a region |
+| `Alt+Shift+F` | Capture the full virtual screen |
 | `Alt+Shift+A` | Capture the active window |
-| `Alt+Shift+W` | Click any window to capture it |
+| `Alt+Shift+W` | Click a window or control to capture it |
 
 Window captures use the visible DWM frame bounds, so invisible resize borders are not included.
 
@@ -53,14 +54,14 @@ Each capture opens in a new tab in the persistent editor window:
 | `Ctrl+C` | Copy to clipboard |
 | `Ctrl+S` | Save |
 | `Ctrl+Shift+S` | Save As |
-| `Esc` | Hide window |
 
 - Each capture opens a new **tab** named with its timestamp (`YYYYMMDDhhmmss`)
 - Window title shows `ezshot-<tab name>`
 - Tabs with unsaved changes show a red dot; it clears on save
 - Click × on a tab to close it — if unsaved, a flat confirmation dialog appears (Save / Don't Save / Cancel)
-- Clicking the window × button prompts for each unsaved tab before hiding the window
-- `Esc` hides the window without prompting — tabs are preserved; double-click the tray icon to restore
+- Clicking the window × button prompts for each unsaved tab, clears all tabs, then hides the editor to the system tray
+- Minimizing the window sends it to the taskbar and preserves all tabs
+- The app exits only from the tray icon context menu
 - Tabs scroll automatically when there are too many; the newest is always visible
 
 ### Settings (tray right-click / toolbar ≡ button)

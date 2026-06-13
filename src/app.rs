@@ -180,7 +180,7 @@ fn state_machine(
             }
             (_, AppEvent::EditorSave) => {}
             (_, AppEvent::ShowEditor) => {
-                // 雙按系統匣：顯示編輯視窗
+                // 雙按系統匣：顯示編輯視窗；若視窗尚未建立則開空白編輯器
                 let hwnd_val = { *editor_hwnd.lock().unwrap() };
                 if let Some(v) = hwnd_val {
                     unsafe {
@@ -189,6 +189,14 @@ fn state_machine(
                             PostMessageW(hw, crate::editor::WM_SHOW_EDITOR, WPARAM(0), LPARAM(0)).ok();
                         }
                     }
+                } else {
+                    let editor_hwnd_clone = editor_hwnd.clone();
+                    let tx2 = tx.clone();
+                    let dir = save_dir.clone();
+                    let config_clone = config.clone();
+                    std::thread::spawn(move || {
+                        crate::editor::open(None, tx2, dir, editor_hwnd_clone, config_clone);
+                    });
                 }
             }
             (_, AppEvent::TrayQuit) => {
@@ -254,6 +262,6 @@ fn dispatch_capture(
     // 編輯器尚未存在，建立持久視窗
     let editor_hwnd_clone = editor_hwnd.clone();
     std::thread::spawn(move || {
-        crate::editor::open(bmp, tx, dir, editor_hwnd_clone, config);
+        crate::editor::open(Some(bmp), tx, dir, editor_hwnd_clone, config);
     });
 }

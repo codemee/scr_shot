@@ -1,6 +1,6 @@
 [package]
 name = "ezshot"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 
 [[bin]]
@@ -24,7 +24,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
+jpeg-decoder = "0.3"
 anyhow = "1"
 
 [profile.release]

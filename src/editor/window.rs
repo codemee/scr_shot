@@ -1,7 +1,8 @@
 ﻿use std::sync::mpsc::Sender;
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Foundation::COLORREF;
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
     CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject,
@@ -9,9 +10,9 @@ use windows::Win32::Graphics::Gdi::{
     IntersectClipRect, InvalidateRect,
     Arc as GdiArc, Ellipse, LineTo, MoveToEx, NULL_BRUSH, Polygon, Polyline,
     Rectangle as GdiRectangle, ReleaseDC, RestoreDC, RoundRect, SaveDC,
-    SelectObject, SetBkMode, SetTextColor,
+    SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt,
     BACKGROUND_MODE, DEFAULT_GUI_FONT, DRAW_TEXT_FORMAT, HRGN, PAINTSTRUCT,
-    PS_SOLID, SRCCOPY,
+    PS_SOLID, SRCCOPY, STRETCH_BLT_MODE,
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, SetScrollInfo};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT};
@@ -56,7 +57,10 @@ const CM_THEME_DARK:  u32 = 3312;
 const CM_QUIT:       u32 = 3099;
 const CM_CLOSE_ALL:  u32 = 3021;
 
-const BTN_SETTINGS: usize = 25; // 設定按鈕（≡）
+const BTN_SETTINGS:  usize = 25; // 設定按鈕（≡）
+const BTN_ZOOM_OUT:  usize = 26;
+const BTN_ZOOM_IN:   usize = 27;
+const WM_DROPFILES: u32 = 0x0233;
 
 const BTN_PEN: usize   = 10;
 const BTN_ARROW: usize = 11;
@@ -76,6 +80,7 @@ struct TabInfo {
     save_dir: std::path::PathBuf,
     scroll_x: i32,
     scroll_y: i32,
+    zoom: f32,   // 縮放倍率（1.0 = 100%）
     result_sent: bool,
     name: String,
     saved_path: Option<std::path::PathBuf>, // 已存檔的完整路徑；再次存檔時直接覆蓋
@@ -102,7 +107,7 @@ struct EditorState {
 }
 
 pub fn open(
-    bmp: ScreenBitmap,
+    bmp: Option<ScreenBitmap>,
     tx: Sender<AppEvent>,
     save_dir: std::path::PathBuf,
     editor_hwnd_arc: std::sync::Arc<std::sync::Mutex<Option<isize>>>,
@@ -131,30 +136,35 @@ pub fn open(
         };
         RegisterClassExW(&wc);
 
-        let canvas = Canvas::new(bmp);
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let min_w = BTN_MARGIN + 12 * (BTN_W + BTN_MARGIN) + 20;
+        let min_w = BTN_MARGIN + 14 * (BTN_W + BTN_MARGIN) + 20;
         let min_h = CANVAS_Y + 120;
-        let win_w = (canvas.width + 20).max(min_w).min(screen_w * 9 / 10);
-        let win_h = (canvas.height + CANVAS_Y + 45).max(min_h).min(screen_h * 9 / 10);
 
-        let first_tab = TabInfo {
-            canvas,
-            save_dir: save_dir.clone(),
-            scroll_x: 0,
-            scroll_y: 0,
-            result_sent: false,
-            name: {
-                let st = windows::Win32::System::SystemInformation::GetLocalTime();
-                format!("{}{:02}{:02}{:02}{:02}{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond)
-            },
-            saved_path: None,
-            modified: false,
+        let (initial_tabs, win_w, win_h) = if let Some(bmp) = bmp {
+            let canvas = Canvas::new(bmp);
+            let ww = (canvas.width + 20).max(min_w).min(screen_w * 9 / 10);
+            let wh = (canvas.height + CANVAS_Y + 45).max(min_h).min(screen_h * 9 / 10);
+            let st = windows::Win32::System::SystemInformation::GetLocalTime();
+            let tab = TabInfo {
+                canvas,
+                save_dir: save_dir.clone(),
+                scroll_x: 0,
+                scroll_y: 0,
+                zoom: 1.0,
+                result_sent: false,
+                name: format!("{}{:02}{:02}{:02}{:02}{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond),
+                saved_path: None,
+                modified: false,
+            };
+            (vec![tab], ww, wh)
+        } else {
+            (vec![], min_w, min_h)
         };
+
         let state = Box::new(EditorState {
             tx,
-            tabs: vec![first_tab],
+            tabs: initial_tabs,
             active_tab: 0,
             tab_counter: 1,
             active_tool: Tool::Pen,
@@ -170,7 +180,7 @@ pub fn open(
             config: config.clone(),
         });
 
-        let hwnd = CreateWindowExW(
+        let hwnd = match CreateWindowExW(
             WS_EX_APPWINDOW,
             class,
             w!("srcshot 編輯器"),
@@ -180,8 +190,10 @@ pub fn open(
             HMENU(std::ptr::null_mut()),
             hinstance,
             Some(Box::into_raw(state) as _),
-        )
-        .unwrap();
+        ) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
 
         // 設定與系統匣相同的視窗圖示
         let app_icon = crate::icon::create_app_icon();
@@ -224,6 +236,9 @@ pub fn open(
         // 每 100ms 輪詢一次游標位置，用於 tooltip 偵測（子視窗擋住父視窗的 WM_MOUSEMOVE）
         SetTimer(hwnd, 3, 100, None);
 
+        // 接受拖放檔案
+        DragAcceptFiles(hwnd, BOOL(1));
+
         // SetForegroundWindow 在跨執行緒且距 WM_HOTKEY 較久時可能因前景鎖失敗。
         // 先暫設 TOPMOST 強制置頂，之後恢復 NOTOPMOST，讓視窗可靠地出現在前景。
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -247,7 +262,7 @@ pub fn open(
 
 unsafe fn create_toolbar(parent: HWND) {
     let hinstance = get_instance();
-    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_MOSAIC, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_SAVEAS, BTN_UNDO, BTN_SETTINGS]
+    for (i, id) in [BTN_PEN, BTN_ARROW, BTN_RECT, BTN_TEXT, BTN_CROP, BTN_MOSAIC, BTN_COLOR, BTN_COPY, BTN_SAVE, BTN_SAVEAS, BTN_UNDO, BTN_ZOOM_OUT, BTN_ZOOM_IN, BTN_SETTINGS]
         .iter().enumerate()
     {
         let x = BTN_MARGIN + i as i32 * (BTN_W + BTN_MARGIN);
@@ -275,9 +290,12 @@ unsafe fn update_scrollbars(hwnd: HWND, state: &EditorState) {
         return;
     }
 
-    // 根據 canvas vs client 決定是否需要捲軸
-    let need_h = state.tabs[state.active_tab].canvas.width  > rc.right;
-    let need_v = state.tabs[state.active_tab].canvas.height > (rc.bottom - CANVAS_Y);
+    // 根據 canvas vs client 決定是否需要捲軸（計入縮放倍率）
+    let zoom = state.tabs[state.active_tab].zoom;
+    let canvas_w = state.tabs[state.active_tab].canvas.width;
+    let canvas_h = state.tabs[state.active_tab].canvas.height;
+    let need_h = (canvas_w as f32 * zoom) as i32 > rc.right;
+    let need_v = (canvas_h as f32 * zoom) as i32 > (rc.bottom - CANVAS_Y);
 
     // 透過切換 WS_HSCROLL / WS_VSCROLL 樣式來顯示或隱藏捲軸
     let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
@@ -295,12 +313,13 @@ unsafe fn update_scrollbars(hwnd: HWND, state: &EditorState) {
 
     if need_h {
         let client_w = rc.right.max(1);
+        let npage = ((client_w as f32 / zoom) as u32).max(1);
         let si = SCROLLINFO {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_ALL,
             nMin: 0,
-            nMax: state.tabs[state.active_tab].canvas.width - 1,
-            nPage: client_w as u32,
+            nMax: canvas_w - 1,
+            nPage: npage,
             nPos: state.tabs[state.active_tab].scroll_x,
             nTrackPos: 0,
         };
@@ -309,12 +328,13 @@ unsafe fn update_scrollbars(hwnd: HWND, state: &EditorState) {
 
     if need_v {
         let client_h = (rc.bottom - CANVAS_Y).max(1);
+        let npage = ((client_h as f32 / zoom) as u32).max(1);
         let si = SCROLLINFO {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_ALL,
             nMin: 0,
-            nMax: state.tabs[state.active_tab].canvas.height - 1,
-            nPage: client_h as u32,
+            nMax: canvas_h - 1,
+            nPage: npage,
             nPos: state.tabs[state.active_tab].scroll_y,
             nTrackPos: 0,
         };
@@ -322,8 +342,9 @@ unsafe fn update_scrollbars(hwnd: HWND, state: &EditorState) {
     }
 }
 
-fn clamp_scroll(val: i32, canvas_size: i32, client_size: i32) -> i32 {
-    val.clamp(0, (canvas_size - client_size).max(0))
+fn clamp_scroll_z(val: i32, canvas_size: i32, client_size: i32, zoom: f32) -> i32 {
+    let max_scroll = (canvas_size as f32 - client_size as f32 / zoom).max(0.0) as i32;
+    val.clamp(0, max_scroll)
 }
 
 unsafe extern "system" fn editor_wnd_proc(
@@ -350,6 +371,8 @@ unsafe extern "system" fn editor_wnd_proc(
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc).unwrap();
             let client_w = rc.right;
+            let zoom = state.tabs[state.active_tab].zoom;
+            let page_w = (client_w as f32 / zoom) as i32;
             let code = (wp.0 & 0xFFFF) as u32;
             let mut si = SCROLLINFO {
                 cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
@@ -360,12 +383,12 @@ unsafe extern "system" fn editor_wnd_proc(
             let new_x = match code {
                 0 => state.tabs[state.active_tab].scroll_x - 20,        // SB_LINELEFT
                 1 => state.tabs[state.active_tab].scroll_x + 20,        // SB_LINERIGHT
-                2 => state.tabs[state.active_tab].scroll_x - client_w,  // SB_PAGELEFT
-                3 => state.tabs[state.active_tab].scroll_x + client_w,  // SB_PAGERIGHT
+                2 => state.tabs[state.active_tab].scroll_x - page_w,    // SB_PAGELEFT
+                3 => state.tabs[state.active_tab].scroll_x + page_w,    // SB_PAGERIGHT
                 5 => si.nTrackPos,               // SB_THUMBTRACK
                 _ => state.tabs[state.active_tab].scroll_x,
             };
-            state.tabs[state.active_tab].scroll_x = clamp_scroll(new_x, state.tabs[state.active_tab].canvas.width, client_w);
+            state.tabs[state.active_tab].scroll_x = clamp_scroll_z(new_x, state.tabs[state.active_tab].canvas.width, client_w, zoom);
             update_scrollbars(hwnd, state);
             InvalidateRect(hwnd, Some(&RECT{left:0,top:CANVAS_Y,right:32767,bottom:32767}), false);
             LRESULT(0)
@@ -376,6 +399,8 @@ unsafe extern "system" fn editor_wnd_proc(
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc).unwrap();
             let client_h = rc.bottom - CANVAS_Y;
+            let zoom = state.tabs[state.active_tab].zoom;
+            let page_h = (client_h as f32 / zoom) as i32;
             let code = (wp.0 & 0xFFFF) as u32;
             let mut si = SCROLLINFO {
                 cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
@@ -386,12 +411,12 @@ unsafe extern "system" fn editor_wnd_proc(
             let new_y = match code {
                 0 => state.tabs[state.active_tab].scroll_y - 20,        // SB_LINEUP
                 1 => state.tabs[state.active_tab].scroll_y + 20,        // SB_LINEDOWN
-                2 => state.tabs[state.active_tab].scroll_y - client_h,  // SB_PAGEUP
-                3 => state.tabs[state.active_tab].scroll_y + client_h,  // SB_PAGEDOWN
+                2 => state.tabs[state.active_tab].scroll_y - page_h,    // SB_PAGEUP
+                3 => state.tabs[state.active_tab].scroll_y + page_h,    // SB_PAGEDOWN
                 5 => si.nTrackPos,               // SB_THUMBTRACK
                 _ => state.tabs[state.active_tab].scroll_y,
             };
-            state.tabs[state.active_tab].scroll_y = clamp_scroll(new_y, state.tabs[state.active_tab].canvas.height, client_h);
+            state.tabs[state.active_tab].scroll_y = clamp_scroll_z(new_y, state.tabs[state.active_tab].canvas.height, client_h, zoom);
             update_scrollbars(hwnd, state);
             InvalidateRect(hwnd, Some(&RECT{left:0,top:CANVAS_Y,right:32767,bottom:32767}), false);
             LRESULT(0)
@@ -400,18 +425,50 @@ unsafe extern "system" fn editor_wnd_proc(
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
             if state.tabs.is_empty() { return LRESULT(0); }
             let delta = ((wp.0 >> 16) as u16) as i16;
+            let ctrl = GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0;
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc).unwrap();
+            let client_w = rc.right;
             let client_h = rc.bottom - CANVAS_Y;
-            let step = 60;
-            let new_y = if delta > 0 {
-                state.tabs[state.active_tab].scroll_y - step
+
+            if ctrl {
+                // Ctrl+滾輪：以游標為錨點縮放
+                let cur_screen_x = (lp.0 & 0xFFFF) as i16 as i32;
+                let cur_screen_y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+                // screen → client：用 GetWindowRect + GetClientRect 算出 NC area
+                let mut wr = RECT::default();
+                GetWindowRect(hwnd, &mut wr).ok();
+                let border_x = ((wr.right - wr.left) - client_w).max(0) / 2;
+                let border_y = (wr.bottom - wr.top) - (rc.bottom) - border_x;
+                let cx = (cur_screen_x - wr.left - border_x).clamp(0, client_w);
+                let cy = (cur_screen_y - wr.top - border_y - CANVAS_Y).clamp(0, client_h);
+
+                let old_z = state.tabs[state.active_tab].zoom;
+                let new_z = if delta > 0 { (old_z * 1.25).min(16.0) } else { (old_z / 1.25).max(0.05) };
+                let canvas_x = cx as f32 / old_z + state.tabs[state.active_tab].scroll_x as f32;
+                let canvas_y = cy as f32 / old_z + state.tabs[state.active_tab].scroll_y as f32;
+                state.tabs[state.active_tab].zoom = new_z;
+                let cw = state.tabs[state.active_tab].canvas.width;
+                let ch = state.tabs[state.active_tab].canvas.height;
+                state.tabs[state.active_tab].scroll_x = clamp_scroll_z((canvas_x - cx as f32 / new_z) as i32, cw, client_w, new_z);
+                state.tabs[state.active_tab].scroll_y = clamp_scroll_z((canvas_y - cy as f32 / new_z) as i32, ch, client_h, new_z);
+                update_scrollbars(hwnd, state);
+                update_window_title(hwnd, state);
+                InvalidateRect(hwnd, Some(&RECT{left:0,top:CANVAS_Y,right:32767,bottom:32767}), false);
             } else {
-                state.tabs[state.active_tab].scroll_y + step
-            };
-            state.tabs[state.active_tab].scroll_y = clamp_scroll(new_y, state.tabs[state.active_tab].canvas.height, client_h);
-            update_scrollbars(hwnd, state);
-            InvalidateRect(hwnd, Some(&RECT{left:0,top:CANVAS_Y,right:32767,bottom:32767}), false);
+                // 一般捲動：步長依縮放倍率調整
+                let zoom = state.tabs[state.active_tab].zoom;
+                let step = (60.0f32 / zoom).max(1.0) as i32;
+                let canvas_h = state.tabs[state.active_tab].canvas.height;
+                let new_y = if delta > 0 {
+                    state.tabs[state.active_tab].scroll_y - step
+                } else {
+                    state.tabs[state.active_tab].scroll_y + step
+                };
+                state.tabs[state.active_tab].scroll_y = clamp_scroll_z(new_y, canvas_h, client_h, zoom);
+                update_scrollbars(hwnd, state);
+                InvalidateRect(hwnd, Some(&RECT{left:0,top:CANVAS_Y,right:32767,bottom:32767}), false);
+            }
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -419,6 +476,7 @@ unsafe extern "system" fn editor_wnd_proc(
             let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
             match id {
                 BTN_PEN | BTN_ARROW | BTN_RECT | BTN_TEXT | BTN_CROP | BTN_MOSAIC => {
+                    if state.tabs.is_empty() { return LRESULT(0); }
                     state.active_tool = match id {
                         BTN_PEN    => Tool::Pen,
                         BTN_ARROW  => Tool::Arrow,
@@ -435,6 +493,7 @@ unsafe extern "system" fn editor_wnd_proc(
                     SetFocus(hwnd);
                 }
                 BTN_COLOR => {
+                    if state.tabs.is_empty() { return LRESULT(0); }
                     let (cur_color, cur_thick) = {
                         let tab = &state.tabs[state.active_tab];
                         (tab.canvas.tool_color, tab.canvas.tool_thickness)
@@ -459,7 +518,34 @@ unsafe extern "system" fn editor_wnd_proc(
                     }
                     SetFocus(hwnd);
                 }
+                BTN_ZOOM_IN | BTN_ZOOM_OUT => {
+                    if state.tabs.is_empty() { return LRESULT(0); }
+                    let mut rc = RECT::default();
+                    GetClientRect(hwnd, &mut rc).unwrap();
+                    let client_w = rc.right;
+                    let client_h = rc.bottom - CANVAS_Y;
+                    let cx = client_w / 2;
+                    let cy = client_h / 2;
+                    let old_z = state.tabs[state.active_tab].zoom;
+                    let new_z = if id == BTN_ZOOM_IN {
+                        (old_z * 1.25).min(16.0)
+                    } else {
+                        (old_z / 1.25).max(0.05)
+                    };
+                    let canvas_x = cx as f32 / old_z + state.tabs[state.active_tab].scroll_x as f32;
+                    let canvas_y = cy as f32 / old_z + state.tabs[state.active_tab].scroll_y as f32;
+                    state.tabs[state.active_tab].zoom = new_z;
+                    let cw = state.tabs[state.active_tab].canvas.width;
+                    let ch = state.tabs[state.active_tab].canvas.height;
+                    state.tabs[state.active_tab].scroll_x = clamp_scroll_z((canvas_x - cx as f32 / new_z) as i32, cw, client_w, new_z);
+                    state.tabs[state.active_tab].scroll_y = clamp_scroll_z((canvas_y - cy as f32 / new_z) as i32, ch, client_h, new_z);
+                    update_scrollbars(hwnd, state);
+                    update_window_title(hwnd, state);
+                    InvalidateRect(hwnd, Some(&RECT{left:0,top:CANVAS_Y,right:32767,bottom:32767}), false);
+                    SetFocus(hwnd);
+                }
                 BTN_UNDO  => {
+                    if state.tabs.is_empty() { return LRESULT(0); }
                     state.tabs[state.active_tab].canvas.undo();
                     if !state.tabs[state.active_tab].modified {
                         state.tabs[state.active_tab].modified = true;
@@ -472,6 +558,7 @@ unsafe extern "system" fn editor_wnd_proc(
                     SetFocus(hwnd);
                 }
                 BTN_COPY => {
+                    if state.tabs.is_empty() { return LRESULT(0); }
                     // 複製後保留分頁（不關閉）
                     let flat = state.tabs[state.active_tab].canvas.flatten_to_bitmap();
                     let _ = crate::output::clipboard::copy_to_clipboard(&flat);
@@ -479,6 +566,9 @@ unsafe extern "system" fn editor_wnd_proc(
                     SetFocus(hwnd);
                 }
                 BTN_SAVE => {
+                    if state.tabs.is_empty() { return LRESULT(0); }
+                    let tab = &state.tabs[state.active_tab];
+                    if !tab.modified && tab.saved_path.is_some() { return LRESULT(0); }
                     let flat = state.tabs[state.active_tab].canvas.flatten_to_bitmap();
                     // 已有儲存路徑 → 直接覆蓋；否則開對話框
                     let existing = state.tabs[state.active_tab].saved_path.clone();
@@ -517,6 +607,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 }
                 BTN_SAVEAS => {
                     // 另存新檔：僅對已存過的標籤有效
+                    if state.tabs.is_empty() { return LRESULT(0); }
                     if state.tabs[state.active_tab].saved_path.is_none() { return LRESULT(0); }
                     let flat = state.tabs[state.active_tab].canvas.flatten_to_bitmap();
                     // 另存新檔：以現有檔名為預設
@@ -608,6 +699,41 @@ unsafe extern "system" fn editor_wnd_proc(
             let vk = wp.0 as u16;
             let ctrl  = GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0;
             let shift = GetKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 != 0;
+            // Ctrl+= / Ctrl+- / Ctrl+0：縮放
+            if ctrl && !shift {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState;
+                if !ptr.is_null() {
+                    let state = &mut *ptr;
+                    if !state.tabs.is_empty() {
+                        let old_z = state.tabs[state.active_tab].zoom;
+                        let new_z: Option<f32> = match vk {
+                            0xBB | 0x6B => Some((old_z * 1.25).min(16.0)),  // = / numpad+
+                            0xBD | 0x6D => Some((old_z / 1.25).max(0.05)),  // - / numpad-
+                            0x30 | 0x60 => Some(1.0f32),                    // 0 / numpad0
+                            _ => None,
+                        };
+                        if let Some(nz) = new_z {
+                            let mut rc = RECT::default();
+                            GetClientRect(hwnd, &mut rc).unwrap();
+                            let client_w = rc.right;
+                            let client_h = rc.bottom - CANVAS_Y;
+                            let cx = client_w / 2;
+                            let cy = client_h / 2;
+                            let canvas_x = cx as f32 / old_z + state.tabs[state.active_tab].scroll_x as f32;
+                            let canvas_y = cy as f32 / old_z + state.tabs[state.active_tab].scroll_y as f32;
+                            state.tabs[state.active_tab].zoom = nz;
+                            let cw = state.tabs[state.active_tab].canvas.width;
+                            let ch = state.tabs[state.active_tab].canvas.height;
+                            state.tabs[state.active_tab].scroll_x = clamp_scroll_z((canvas_x - cx as f32 / nz) as i32, cw, client_w, nz);
+                            state.tabs[state.active_tab].scroll_y = clamp_scroll_z((canvas_y - cy as f32 / nz) as i32, ch, client_h, nz);
+                            update_scrollbars(hwnd, state);
+                            update_window_title(hwnd, state);
+                            InvalidateRect(hwnd, Some(&RECT{left:0,top:CANVAS_Y,right:32767,bottom:32767}), false);
+                            return DefWindowProcW(hwnd, msg, wp, lp);
+                        }
+                    }
+                }
+            }
             let btn: Option<usize> = match (ctrl, shift, vk) {
                 (true, false, 0x5A) => Some(BTN_UNDO),  // Ctrl+Z
                 (true, false, 0x43) => Some(BTN_COPY),  // Ctrl+C
@@ -674,8 +800,13 @@ unsafe extern "system" fn editor_wnd_proc(
 
             let cy_canvas = cy - CANVAS_Y;
             if cy_canvas < 0 { return LRESULT(0); }
-            // 加上 scroll offset 轉成 canvas 座標
-            let pt = POINT { x: cx + state.tabs[state.active_tab].scroll_x, y: cy_canvas + state.tabs[state.active_tab].scroll_y };
+            if state.tabs.is_empty() { return LRESULT(0); }
+            // screen → canvas 座標（計入縮放與捲動偏移）
+            let zoom = state.tabs[state.active_tab].zoom;
+            let pt = POINT {
+                x: (cx as f32 / zoom) as i32 + state.tabs[state.active_tab].scroll_x,
+                y: (cy_canvas as f32 / zoom) as i32 + state.tabs[state.active_tab].scroll_y,
+            };
 
             match state.active_tool {
                 Tool::Text => {
@@ -712,9 +843,10 @@ unsafe extern "system" fn editor_wnd_proc(
             state.hovering_canvas = cy_mm >= CANVAS_Y;
             if !state.dragging { return LRESULT(0); }
             let (cx, cy) = client_xy(lp);
+            let zoom = state.tabs[state.active_tab].zoom;
             let pt = POINT {
-                x: cx + state.tabs[state.active_tab].scroll_x,
-                y: (cy - CANVAS_Y) + state.tabs[state.active_tab].scroll_y,
+                x: (cx as f32 / zoom) as i32 + state.tabs[state.active_tab].scroll_x,
+                y: ((cy - CANVAS_Y) as f32 / zoom) as i32 + state.tabs[state.active_tab].scroll_y,
             };
             match state.active_tool {
                 Tool::Pen => {
@@ -930,14 +1062,23 @@ unsafe extern "system" fn editor_wnd_proc(
                 state.tabs[state.active_tab].canvas.render(canvas_dc, screen_dc,
                     matches!(state.active_tool, Tool::Crop | Tool::Mosaic));
 
-                let vis_w = (state.tabs[state.active_tab].canvas.width
-                    - state.tabs[state.active_tab].scroll_x).min(client_w).max(0);
-                let vis_h = (state.tabs[state.active_tab].canvas.height
-                    - state.tabs[state.active_tab].scroll_y).min(client_h).max(0);
-                if vis_w > 0 && vis_h > 0 {
-                    BitBlt(buf_dc, 0, 0, vis_w, vis_h, canvas_dc,
+                let zoom = state.tabs[state.active_tab].zoom;
+                // 計算來源（canvas 像素）與目的（螢幕像素）區域
+                let src_w = ((client_w as f32 / zoom).ceil() as i32)
+                    .min(state.tabs[state.active_tab].canvas.width - state.tabs[state.active_tab].scroll_x)
+                    .max(0);
+                let src_h = ((client_h as f32 / zoom).ceil() as i32)
+                    .min(state.tabs[state.active_tab].canvas.height - state.tabs[state.active_tab].scroll_y)
+                    .max(0);
+                let dst_w = ((src_w as f32 * zoom) as i32).min(client_w).max(0);
+                let dst_h = ((src_h as f32 * zoom) as i32).min(client_h).max(0);
+                if src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0 {
+                    SetStretchBltMode(buf_dc, STRETCH_BLT_MODE(3)); // COLORONCOLOR
+                    StretchBlt(buf_dc, 0, 0, dst_w, dst_h,
+                        canvas_dc,
                         state.tabs[state.active_tab].scroll_x,
-                        state.tabs[state.active_tab].scroll_y, SRCCOPY).unwrap();
+                        state.tabs[state.active_tab].scroll_y,
+                        src_w, src_h, SRCCOPY).unwrap();
                 }
 
                 SelectObject(canvas_dc, old_canvas);
@@ -1122,6 +1263,21 @@ unsafe extern "system" fn editor_wnd_proc(
                         POINT{x:cx-6,y:cy+3}, POINT{x:cx-8,y:cy}, POINT{x:cx-4,y:cy},
                     ]);
                 }
+                BTN_ZOOM_OUT => {
+                    let o = SelectObject(hdc, nb);
+                    Ellipse(hdc, cx-7, cy-7, cx+3, cy+3);
+                    SelectObject(hdc, o);
+                    let _ = MoveToEx(hdc, cx+2, cy+2, None); let _ = LineTo(hdc, cx+7, cy+7);
+                    let _ = MoveToEx(hdc, cx-5, cy-2, None); let _ = LineTo(hdc, cx+1, cy-2);
+                }
+                BTN_ZOOM_IN => {
+                    let o = SelectObject(hdc, nb);
+                    Ellipse(hdc, cx-7, cy-7, cx+3, cy+3);
+                    SelectObject(hdc, o);
+                    let _ = MoveToEx(hdc, cx+2, cy+2, None); let _ = LineTo(hdc, cx+7, cy+7);
+                    let _ = MoveToEx(hdc, cx-5, cy-2, None); let _ = LineTo(hdc, cx+1, cy-2);
+                    let _ = MoveToEx(hdc, cx-2, cy-5, None); let _ = LineTo(hdc, cx-2, cy+1);
+                }
                 BTN_SETTINGS => {
                     // ≡ 三條橫線
                     for dy in [-5i32, 0, 5] {
@@ -1155,7 +1311,7 @@ unsafe extern "system" fn editor_wnd_proc(
                 match GetDlgCtrlID(under) as usize {
                     BTN_PEN   => 0, BTN_ARROW => 1, BTN_RECT  => 2, BTN_TEXT  => 3,
                     BTN_CROP => 4, BTN_MOSAIC => 5, BTN_COLOR => 6, BTN_COPY => 7,
-                    BTN_SAVE => 8, BTN_SAVEAS => 9, BTN_UNDO => 10, BTN_SETTINGS => 11, _ => -1,
+                    BTN_SAVE => 8, BTN_SAVEAS => 9, BTN_UNDO => 10, BTN_ZOOM_OUT => 11, BTN_ZOOM_IN => 12, BTN_SETTINGS => 13, _ => -1,
                 }
             };
             if btn_hover != state.hover_btn {
@@ -1177,6 +1333,8 @@ unsafe extern "system" fn editor_wnd_proc(
                         (crate::i18n::t("儲存","Save"),       "Ctrl+S"),
                         (crate::i18n::t("另存","Save As"),    "Ctrl+Shift+S"),
                         (crate::i18n::t("復原","Undo"),       "Ctrl+Z"),
+                        (crate::i18n::t("縮小","Zoom Out"),   "Ctrl+-"),
+                        (crate::i18n::t("放大","Zoom In"),    "Ctrl++"),
                         (crate::i18n::t("設定","Settings"),   ""),
                     ];
                     if let Some((name, shortcut)) = labels.get(btn_hover as usize) {
@@ -1231,14 +1389,11 @@ unsafe extern "system" fn editor_wnd_proc(
             InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
-        // 雙按系統匣 → 帶到前景（無分頁時不顯示）
+        // 雙按系統匣 → 帶到前景
         WM_SHOW_EDITOR => {
-            let state = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
-            if !state.tabs.is_empty() {
-                SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW).ok();
-                SetForegroundWindow(hwnd).ok();
-                SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE).ok();
-            }
+            SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW).ok();
+            SetForegroundWindow(hwnd).ok();
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE).ok();
             LRESULT(0)
         }
         // 新截圖分頁（lParam = *mut ScreenBitmap）
@@ -1246,36 +1401,50 @@ unsafe extern "system" fn editor_wnd_proc(
             if lp.0 != 0 {
                 let bmp = *Box::from_raw(lp.0 as *mut ScreenBitmap);
                 let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
-                state.tab_counter += 1;
-                state.tabs.push(TabInfo {
-                    canvas: Canvas::new(bmp),
-                    save_dir: state.default_save_dir.clone(),
-                    scroll_x: 0, scroll_y: 0,
-                    result_sent: false,
-                    name: {
-                        let st = windows::Win32::System::SystemInformation::GetLocalTime();
-                        format!("{}{:02}{:02}{:02}{:02}{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond)
-                    },
-                    saved_path: None,
-            modified: false,
-                });
-                state.active_tab = state.tabs.len() - 1;
-                state.dragging = false;
-                // 捲動到新標籤（讓既有標籤往左移）
-                {
-                    let mut rc_tmp = RECT::default();
-                    GetClientRect(hwnd, &mut rc_tmp).ok();
-                    let mv = ((rc_tmp.right - 22) / TAB_W).max(1) as usize;
-                    if state.active_tab >= state.tab_scroll + mv {
-                        state.tab_scroll = state.active_tab + 1 - mv;
-                    }
-                }
+                let st = windows::Win32::System::SystemInformation::GetLocalTime();
+                let name = format!("{}{:02}{:02}{:02}{:02}{:02}", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+                add_tab_from_bmp(hwnd, state, bmp, name);
                 SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW).ok();
                 SetForegroundWindow(hwnd).ok();
                 SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE).ok();
-                update_scrollbars(hwnd, state);
-                update_window_title(hwnd, state);
-                InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        // 拖放圖檔 → 每個檔案建立一個新分頁
+        WM_DROPFILES => {
+            let hdrop = HDROP(wp.0 as *mut _);
+            let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
+            let mut added = false;
+            for i in 0..count {
+                let len = DragQueryFileW(hdrop, i, None) as usize;
+                if len == 0 { continue; }
+                let mut buf = vec![0u16; len + 1];
+                DragQueryFileW(hdrop, i, Some(&mut buf));
+                let path_str = String::from_utf16_lossy(&buf[..len]);
+                let path = std::path::PathBuf::from(&path_str);
+                if let Some((iw, ih, bgra)) = load_image_bgra(&path) {
+                    let bmp = crate::capture::screen::ScreenBitmap { width: iw, height: ih, data: bgra };
+                    let tab_name = path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("image")
+                        .to_string();
+                    let state = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditorState);
+                    add_tab_from_bmp(hwnd, state, bmp, tab_name);
+                    // 拖放的圖檔視為已存檔，記錄原始路徑，不顯示紅點
+                    let idx = state.tabs.len() - 1;
+                    state.tabs[idx].saved_path = Some(path.clone());
+                    state.tabs[idx].modified = false;
+                    if let Some(parent) = path.parent() {
+                        state.tabs[idx].save_dir = parent.to_path_buf();
+                    }
+                    added = true;
+                }
+            }
+            DragFinish(hdrop);
+            if added {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW).ok();
+                SetForegroundWindow(hwnd).ok();
+                SetWindowPos(hwnd, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE).ok();
             }
             LRESULT(0)
         }
@@ -1300,11 +1469,19 @@ unsafe extern "system" fn editor_wnd_proc(
     }
 }
 
-/// 依目前作用中標籤更新視窗標題
+/// 依目前作用中標籤更新視窗標題；非 100% 縮放時附加 [N%]
 unsafe fn update_window_title(hwnd: HWND, state: &EditorState) {
-    if state.tabs.is_empty() { return; }
-    let title: Vec<u16> = format!("ezshot-{}\0", state.tabs[state.active_tab].name)
-        .encode_utf16().collect();
+    let title: Vec<u16> = if state.tabs.is_empty() {
+        "ezshot\0".encode_utf16().collect()
+    } else {
+        let tab = &state.tabs[state.active_tab];
+        let zoom_pct = (tab.zoom * 100.0).round() as i32;
+        if zoom_pct != 100 {
+            format!("ezshot-{} [{}%]\0", tab.name, zoom_pct).encode_utf16().collect()
+        } else {
+            format!("ezshot-{}\0", tab.name).encode_utf16().collect()
+        }
+    };
     SetWindowTextW(hwnd, windows::core::PCWSTR(title.as_ptr())).ok();
 }
 
@@ -1471,6 +1648,32 @@ unsafe fn close_tab(hwnd: HWND, state: &mut EditorState, idx: usize) {
     InvalidateRect(hwnd, None, false);
 }
 
+/// 新增分頁並切換到該分頁（供 WM_NEW_TAB 與拖放共用）
+unsafe fn add_tab_from_bmp(hwnd: HWND, state: &mut EditorState, bmp: ScreenBitmap, name: String) {
+    state.tab_counter += 1;
+    state.tabs.push(TabInfo {
+        canvas: Canvas::new(bmp),
+        save_dir: state.default_save_dir.clone(),
+        scroll_x: 0, scroll_y: 0,
+        zoom: 1.0,
+        result_sent: false,
+        name,
+        saved_path: None,
+        modified: false,
+    });
+    state.active_tab = state.tabs.len() - 1;
+    state.dragging = false;
+    let mut rc_tmp = RECT::default();
+    GetClientRect(hwnd, &mut rc_tmp).ok();
+    let mv = ((rc_tmp.right - 22) / TAB_W).max(1) as usize;
+    if state.active_tab >= state.tab_scroll + mv {
+        state.tab_scroll = state.active_tab + 1 - mv;
+    }
+    update_scrollbars(hwnd, state);
+    update_window_title(hwnd, state);
+    InvalidateRect(hwnd, None, false);
+}
+
 /// 儲存指定索引的分頁（會開啟存檔對話框），回傳 true 表示完成，false 表示取消
 unsafe fn save_tab_file(hwnd: HWND, state: &mut EditorState, idx: usize) -> bool {
     let flat = state.tabs[idx].canvas.flatten_to_bitmap();
@@ -1616,6 +1819,7 @@ unsafe fn close_all_tabs(hwnd: HWND, state: &mut EditorState) {
     state.tabs.clear();
     state.active_tab = 0;
     state.tab_scroll = 0;
+    update_window_title(hwnd, state);
     ShowWindow(hwnd, SW_HIDE);
 }
 
@@ -2393,4 +2597,44 @@ fn get_instance() -> windows::Win32::Foundation::HINSTANCE {
             .unwrap()
             .into()
     }
+}
+
+/// 載入圖檔並轉成 BGRA；先用 image crate，失敗時對 JPEG 用 jpeg-decoder 備援
+fn load_image_bgra(path: &std::path::Path) -> Option<(i32, i32, Vec<u8>)> {
+    if let Ok(img) = image::open(path) {
+        let rgba = img.to_rgba8();
+        let (w, h) = (img.width() as i32, img.height() as i32);
+        let bgra = rgba.pixels()
+            .flat_map(|p| { let [r, g, b, a] = p.0; [b, g, r, a] })
+            .collect();
+        return Some((w, h, bgra));
+    }
+    // image crate 失敗時，對 JPEG 改用 jpeg-decoder（相容性更好）
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if matches!(ext.as_str(), "jpg" | "jpeg" | "jfif") {
+        let file = std::fs::File::open(path).ok()?;
+        let mut dec = jpeg_decoder::Decoder::new(std::io::BufReader::new(file));
+        let pixels = dec.decode().ok()?;
+        let info = dec.info()?;
+        let (w, h) = (info.width as i32, info.height as i32);
+        let bgra: Vec<u8> = match info.pixel_format {
+            jpeg_decoder::PixelFormat::RGB24 => pixels.chunks(3)
+                .flat_map(|p| [p[2], p[1], p[0], 255u8])
+                .collect(),
+            jpeg_decoder::PixelFormat::L8 => pixels.iter()
+                .flat_map(|&l| [l, l, l, 255u8])
+                .collect(),
+            jpeg_decoder::PixelFormat::CMYK32 => pixels.chunks(4)
+                .flat_map(|c| {
+                    let r = (c[0] as u16 * c[3] as u16 / 255) as u8;
+                    let g = (c[1] as u16 * c[3] as u16 / 255) as u8;
+                    let b = (c[2] as u16 * c[3] as u16 / 255) as u8;
+                    [b, g, r, 255u8]
+                })
+                .collect(),
+            _ => return None,
+        };
+        return Some((w, h, bgra));
+    }
+    None
 }

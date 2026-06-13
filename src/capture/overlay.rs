@@ -1,6 +1,9 @@
 use std::sync::mpsc::Sender;
 use windows::core::w;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
 use windows::Win32::Graphics::Gdi::{
     BACKGROUND_MODE, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
     BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
@@ -334,7 +337,12 @@ unsafe extern "system" fn pick_wnd_proc(
 /// 枚舉所有頂層視窗，找出游標下方（排除 overlay 自身）的可見頂層視窗。
 /// 不需要 hide/show overlay，完全消除閃爍。
 unsafe fn find_window_at(overlay: HWND, pt: POINT) -> HWND {
-    struct Ctx { pt: POINT, overlay: HWND, result: HWND }
+    struct Ctx {
+        pt: POINT,
+        overlay: HWND,
+        result: HWND,
+        result_area: i64,
+    }
 
     unsafe extern "system" fn enum_cb(hwnd: HWND, lp: LPARAM) -> BOOL {
         let ctx = &mut *(lp.0 as *mut Ctx);
@@ -354,15 +362,41 @@ unsafe fn find_window_at(overlay: HWND, pt: POINT) -> HWND {
         }
         let pt = ctx.pt;
         if pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom {
-            ctx.result = hwnd;
-            return BOOL(0); // 找到，停止枚舉
+            let area = (rc.right - rc.left) as i64 * (rc.bottom - rc.top) as i64;
+            if ctx.result.is_invalid() || area < ctx.result_area {
+                ctx.result = hwnd;
+                ctx.result_area = area;
+            }
         }
         BOOL(1)
     }
 
-    let mut ctx = Ctx { pt, overlay, result: HWND(std::ptr::null_mut()) };
+    let mut ctx = Ctx {
+        pt,
+        overlay,
+        result: HWND(std::ptr::null_mut()),
+        result_area: i64::MAX,
+    };
     let _ = EnumWindows(Some(enum_cb), LPARAM(&mut ctx as *mut _ as isize));
     ctx.result
+}
+
+unsafe fn visible_window_rect(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        &mut rect as *mut _ as *mut _,
+        std::mem::size_of::<RECT>() as u32,
+    ).is_ok() && rect.right > rect.left && rect.bottom > rect.top {
+        return Some(rect);
+    }
+
+    if GetWindowRect(hwnd, &mut rect).is_ok() && rect.right > rect.left && rect.bottom > rect.top {
+        Some(rect)
+    } else {
+        None
+    }
 }
 
 /// UpdateLayeredWindow 聚光燈效果：
@@ -406,8 +440,7 @@ unsafe fn pick_update_overlay(hwnd: HWND, hover: HWND) {
 
     // Step 2：hover 視窗處挖空（透明）並畫橘色邊框
     if !hover.is_invalid() {
-        let mut wr = RECT::default();
-        if GetWindowRect(hover, &mut wr).is_ok() {
+        if let Some(wr) = visible_window_rect(hover) {
             // 轉換到 DIB 座標（原點 = 虛擬螢幕左上角）
             let l = (wr.left   - vx).clamp(0, vw) as usize;
             let t = (wr.top    - vy).clamp(0, vh) as usize;

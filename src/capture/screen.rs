@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
     GetDC, ReleaseDC, SelectObject, SRCCOPY, HDC, HBRUSH,
@@ -97,15 +100,26 @@ pub fn active_window_rect() -> Result<RECT> {
     unsafe {
         let hwnd = GetForegroundWindow();
         anyhow::ensure!(!hwnd.is_invalid(), "no foreground window");
-        let mut rect = RECT::default();
-        GetWindowRect(hwnd, &mut rect).context("GetWindowRect failed")?;
-        Ok(rect)
+        visible_window_rect(hwnd)
     }
 }
 
 pub fn window_rect(hwnd: HWND) -> Result<RECT> {
+    unsafe { visible_window_rect(hwnd) }
+}
+
+unsafe fn visible_window_rect(hwnd: HWND) -> Result<RECT> {
+    let mut rect = RECT::default();
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        &mut rect as *mut _ as *mut _,
+        std::mem::size_of::<RECT>() as u32,
+    ).is_ok() && rect.right > rect.left && rect.bottom > rect.top {
+        return Ok(rect);
+    }
+
     unsafe {
-        let mut rect = RECT::default();
         GetWindowRect(hwnd, &mut rect).context("GetWindowRect failed")?;
         Ok(rect)
     }

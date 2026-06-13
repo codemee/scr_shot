@@ -14,6 +14,8 @@ A Windows screenshot tool that lives in the system tray, with global hotkeys, an
 | `Alt+Shift+A` | Capture the active window |
 | `Alt+Shift+W` | Click any window to capture it |
 
+Window captures use the visible DWM frame bounds, so invisible resize borders are not included.
+
 ### Delayed Capture
 
 Set a delay (0 / 1 / 2 / 3 / 5 s or custom) from the tray menu to capture hover menus, tooltips, and other transient states. A countdown and an orange highlight box are shown during the delay.
